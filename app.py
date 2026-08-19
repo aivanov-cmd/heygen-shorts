@@ -34,3 +34,4 @@ def preview(request: ShortsRequest):
         "scene_2": "Здесь будет вторая сцена",
         "scene_3": "Здесь будет третья сцена"
     }
+# preview endpoint added
