@@ -57,3 +57,12 @@ def create_shorts(request: ShortsRequest):
             "template_id": "2596b61c4be848bf90b321ab6ebdb158"
         }
     }
+@app.get("/heygen-config")
+def heygen_config():
+    return {
+        "status": "waiting_for_oauth",
+        "mcp_url": "https://mcp.heygen.com/mcp/v1/",
+        "template_id": "2596b61c4be848bf90b321ab6ebdb158",
+        "billing_mode_required": "web_plan_oauth",
+        "render_enabled": False
+    }
