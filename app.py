@@ -19,10 +19,10 @@ AVATAR_2 = "edd35073c03b4af2a8ddb07b0c62e9cc"
 AVATAR_3 = "31c27d30df2d447089cd1fb41e58959e"
 
 VOICE_ID = "ba1544b5eae84eae9cb92598f078b6b0"
-
 TEMPLATE_ID = "2596b61c4be848bf90b321ab6ebdb158"
 
 MAX_DAILY_VIDEOS = 30
+RENDER_ENABLED = False
 
 
 # ============================================================
@@ -68,7 +68,6 @@ def init_db():
     """)
 
     conn.commit()
-
     cur.close()
     conn.close()
 
@@ -79,7 +78,7 @@ def startup():
 
 
 # ============================================================
-# REQUEST MODELS
+# MODELS
 # ============================================================
 
 class ShortsRequest(BaseModel):
@@ -91,6 +90,13 @@ class ShortsRequest(BaseModel):
 
 class BatchRequest(BaseModel):
     shorts: List[ShortsRequest]
+
+
+class ShortsUpdate(BaseModel):
+    topic: str
+    scene_1: str
+    scene_2: str
+    scene_3: str
 
 
 # ============================================================
@@ -140,7 +146,7 @@ def heygen_config():
         "status": "waiting_for_oauth",
         "template_id": TEMPLATE_ID,
         "billing_mode_required": "web_plan_oauth",
-        "render_enabled": False
+        "render_enabled": RENDER_ENABLED
     }
 
 
@@ -149,7 +155,6 @@ def heygen_config():
 # ============================================================
 
 def save_short(short: ShortsRequest):
-
     conn = get_db()
     cur = conn.cursor()
 
@@ -186,7 +191,6 @@ def save_short(short: ShortsRequest):
     short_id = cur.fetchone()[0]
 
     conn.commit()
-
     cur.close()
     conn.close()
 
@@ -194,12 +198,11 @@ def save_short(short: ShortsRequest):
 
 
 # ============================================================
-# ONE SHORT
+# CREATE ONE SHORT
 # ============================================================
 
 @app.post("/shorts")
 def create_short(short: ShortsRequest):
-
     short_id = save_short(short)
 
     return {
@@ -210,12 +213,11 @@ def create_short(short: ShortsRequest):
 
 
 # ============================================================
-# BATCH
+# CREATE BATCH
 # ============================================================
 
 @app.post("/batch")
 def create_batch(request: BatchRequest):
-
     if len(request.shorts) == 0:
         raise HTTPException(
             status_code=400,
@@ -231,7 +233,6 @@ def create_batch(request: BatchRequest):
     created = []
 
     for short in request.shorts:
-
         short_id = save_short(short)
 
         created.append({
@@ -248,12 +249,11 @@ def create_batch(request: BatchRequest):
 
 
 # ============================================================
-# GET QUEUE
+# QUEUE
 # ============================================================
 
 @app.get("/queue")
 def get_queue():
-
     conn = get_db()
     cur = conn.cursor()
 
@@ -270,7 +270,7 @@ def get_queue():
             created_at
         FROM shorts
         ORDER BY id DESC
-        LIMIT 100
+        LIMIT 200
     """)
 
     rows = cur.fetchall()
@@ -300,12 +300,51 @@ def get_queue():
 
 
 # ============================================================
-# APPROVE
+# STATS
+# ============================================================
+
+@app.get("/stats")
+def get_stats():
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT status, COUNT(*)
+        FROM shorts
+        GROUP BY status
+    """)
+
+    rows = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    stats = {
+        "ready": 0,
+        "approved": 0,
+        "generating": 0,
+        "completed": 0,
+        "failed": 0
+    }
+
+    total = 0
+
+    for status, count in rows:
+        stats[status] = count
+        total += count
+
+    return {
+        "total": total,
+        **stats
+    }
+
+
+# ============================================================
+# APPROVE ONE
 # ============================================================
 
 @app.post("/shorts/{short_id}/approve")
 def approve_short(short_id: int):
-
     conn = get_db()
     cur = conn.cursor()
 
@@ -323,7 +362,6 @@ def approve_short(short_id: int):
     result = cur.fetchone()
 
     conn.commit()
-
     cur.close()
     conn.close()
 
@@ -340,12 +378,87 @@ def approve_short(short_id: int):
 
 
 # ============================================================
-# DELETE
+# APPROVE ALL
+# ============================================================
+
+@app.post("/approve-all")
+def approve_all():
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        UPDATE shorts
+        SET status = 'approved',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE status = 'ready'
+        RETURNING id
+    """)
+
+    rows = cur.fetchall()
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {
+        "status": "approved",
+        "count": len(rows)
+    }
+
+
+# ============================================================
+# EDIT SHORT
+# ============================================================
+
+@app.put("/shorts/{short_id}")
+def update_short(short_id: int, update: ShortsUpdate):
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        UPDATE shorts
+        SET topic = %s,
+            scene_1 = %s,
+            scene_2 = %s,
+            scene_3 = %s,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = %s
+        RETURNING id
+        """,
+        (
+            update.topic,
+            update.scene_1,
+            update.scene_2,
+            update.scene_3,
+            short_id
+        )
+    )
+
+    result = cur.fetchone()
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    if not result:
+        raise HTTPException(
+            status_code=404,
+            detail="Short not found"
+        )
+
+    return {
+        "id": short_id,
+        "status": "updated"
+    }
+
+
+# ============================================================
+# DELETE SHORT
 # ============================================================
 
 @app.delete("/shorts/{short_id}")
 def delete_short(short_id: int):
-
     conn = get_db()
     cur = conn.cursor()
 
@@ -357,7 +470,6 @@ def delete_short(short_id: int):
     result = cur.fetchone()
 
     conn.commit()
-
     cur.close()
     conn.close()
 
@@ -374,21 +486,34 @@ def delete_short(short_id: int):
 
 
 # ============================================================
+# FUTURE GENERATE ENDPOINT
+# ============================================================
+
+@app.post("/generate-approved")
+def generate_approved():
+    if not RENDER_ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail="HeyGen rendering is disabled until OAuth is approved"
+        )
+
+    return {
+        "status": "not_implemented_yet"
+    }
+
+
+# ============================================================
 # PANEL
 # ============================================================
 
 @app.get("/panel", response_class=HTMLResponse)
 def panel():
-
     return """
 <!DOCTYPE html>
-
 <html lang="ru">
 
 <head>
-
 <meta charset="UTF-8">
-
 <title>HeyGen Shorts Generator</title>
 
 <style>
@@ -400,17 +525,33 @@ body {
     padding: 20px;
 }
 
+h1 {
+    margin-bottom: 5px;
+}
+
+.topbar {
+    margin: 20px 0;
+    padding: 15px;
+    background: #f6f6f6;
+    border-radius: 8px;
+}
+
 textarea {
     width: 100%;
-    height: 300px;
+    min-height: 120px;
     font-family: monospace;
-    padding: 12px;
+    padding: 10px;
 }
 
 button {
     padding: 10px 16px;
-    margin: 5px;
+    margin: 5px 5px 5px 0;
     cursor: pointer;
+}
+
+button:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
 }
 
 .short {
@@ -444,19 +585,47 @@ button {
     margin: 8px 0;
 }
 
-</style>
+.edit-box {
+    display: none;
+    margin-top: 15px;
+}
 
+.edit-box input,
+.edit-box textarea {
+    width: 100%;
+    margin-bottom: 10px;
+}
+
+.status-badge {
+    font-weight: bold;
+}
+
+</style>
 </head>
 
 <body>
 
 <h1>HeyGen Shorts Generator</h1>
+<p>Очередь Shorts для HeyGen</p>
+
+<div class="topbar">
+    <div id="stats">Загрузка статистики...</div>
+
+    <br>
+
+    <button onclick="approveAll()">
+        Approve all
+    </button>
+
+    <button disabled title="Будет доступно после HeyGen OAuth">
+        Generate approved 🔒
+    </button>
+</div>
+
 
 <h2>Добавить Shorts</h2>
 
-<p>
-Вставь JSON из ChatGPT:
-</p>
+<p>Вставь JSON из ChatGPT:</p>
 
 <textarea id="input">
 {
@@ -474,18 +643,17 @@ button {
 <br>
 
 <button onclick="sendBatch()">
-Добавить в очередь
+    Добавить в очередь
 </button>
 
 <span id="message"></span>
-
 
 <hr>
 
 <h2>Очередь</h2>
 
-<button onclick="loadQueue()">
-Обновить
+<button onclick="loadAll()">
+    Обновить
 </button>
 
 <div id="queue"></div>
@@ -493,74 +661,65 @@ button {
 
 <script>
 
-
 async function sendBatch() {
-
-    const message =
-        document.getElementById("message");
+    const message = document.getElementById("message");
 
     try {
+        const data = JSON.parse(
+            document.getElementById("input").value
+        );
 
-        const data =
-            JSON.parse(
-                document.getElementById("input").value
-            );
+        message.textContent = "Сохраняю...";
 
-        message.textContent =
-            "Сохраняю...";
+        const response = await fetch("/batch", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify(data)
+        });
 
-        const response =
-            await fetch("/batch", {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify(data)
-            });
-
-        const answer =
-            await response.json();
+        const answer = await response.json();
 
         if (!response.ok) {
-            throw new Error(
-                answer.detail || "Ошибка"
-            );
+            throw new Error(answer.detail || "Ошибка");
         }
 
-        message.textContent =
-            "Добавлено: " + answer.count;
+        message.textContent = "Добавлено: " + answer.count;
 
-        loadQueue();
+        loadAll();
 
-    }
-
-    catch (error) {
-
+    } catch (error) {
         message.textContent =
             "Ошибка: " + error.message;
-
     }
+}
 
+
+async function loadStats() {
+    const response = await fetch("/stats");
+    const stats = await response.json();
+
+    document.getElementById("stats").innerHTML =
+        "<strong>Всего:</strong> " + stats.total +
+        " | Ready: " + stats.ready +
+        " | Approved: " + stats.approved +
+        " | Generating: " + stats.generating +
+        " | Completed: " + stats.completed +
+        " | Failed: " + stats.failed;
 }
 
 
 async function loadQueue() {
+    const response = await fetch("/queue");
+    const data = await response.json();
 
-    const response =
-        await fetch("/queue");
-
-    const data =
-        await response.json();
-
-    const container =
-        document.getElementById("queue");
-
+    const container = document.getElementById("queue");
     container.innerHTML = "";
 
     data.shorts.forEach(short => {
 
-        const item =
-            document.createElement("div");
+        const item = document.createElement("div");
 
         item.className =
             "short " + short.status;
@@ -568,24 +727,20 @@ async function loadQueue() {
         let video = "";
 
         if (short.video_url) {
-
             video =
                 '<p><a href="' +
                 short.video_url +
                 '" target="_blank">Открыть видео</a></p>';
-
         }
 
         item.innerHTML = `
 
-            <h3>
-                #${short.id}
-                ${short.topic}
-            </h3>
+            <h3>#${short.id} ${short.topic}</h3>
 
             <p>
-                <strong>Статус:</strong>
-                ${short.status}
+                <span class="status-badge">
+                    Статус: ${short.status}
+                </span>
             </p>
 
             <div class="scene">
@@ -605,21 +760,114 @@ async function loadQueue() {
 
             ${video}
 
-            <button
-                onclick="approveShort(${short.id})">
-                Approve
+            <button onclick="showEdit(${short.id})">
+                Edit
             </button>
 
-            <button
-                onclick="deleteShort(${short.id})">
+            ${
+                short.status === "ready"
+                ? `<button onclick="approveShort(${short.id})">Approve</button>`
+                : ""
+            }
+
+            <button onclick="deleteShort(${short.id})">
                 Delete
             </button>
+
+            <div class="edit-box" id="edit-${short.id}">
+
+                <input
+                    id="topic-${short.id}"
+                    value="${escapeHtml(short.topic)}"
+                >
+
+                <textarea id="scene1-${short.id}">${escapeHtml(short.scene_1)}</textarea>
+
+                <textarea id="scene2-${short.id}">${escapeHtml(short.scene_2)}</textarea>
+
+                <textarea id="scene3-${short.id}">${escapeHtml(short.scene_3)}</textarea>
+
+                <button onclick="saveEdit(${short.id})">
+                    Save
+                </button>
+
+                <button onclick="hideEdit(${short.id})">
+                    Cancel
+                </button>
+
+            </div>
         `;
 
         container.appendChild(item);
-
     });
+}
 
+
+function escapeHtml(text) {
+    return String(text)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;");
+}
+
+
+function showEdit(id) {
+    document.getElementById(
+        "edit-" + id
+    ).style.display = "block";
+}
+
+
+function hideEdit(id) {
+    document.getElementById(
+        "edit-" + id
+    ).style.display = "none";
+}
+
+
+async function saveEdit(id) {
+
+    const body = {
+        topic:
+            document.getElementById(
+                "topic-" + id
+            ).value,
+
+        scene_1:
+            document.getElementById(
+                "scene1-" + id
+            ).value,
+
+        scene_2:
+            document.getElementById(
+                "scene2-" + id
+            ).value,
+
+        scene_3:
+            document.getElementById(
+                "scene3-" + id
+            ).value
+    };
+
+    const response = await fetch(
+        "/shorts/" + id,
+        {
+            method: "PUT",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify(body)
+        }
+    );
+
+    if (!response.ok) {
+        const answer = await response.json();
+        alert(answer.detail || "Ошибка сохранения");
+        return;
+    }
+
+    loadAll();
 }
 
 
@@ -632,8 +880,32 @@ async function approveShort(id) {
         }
     );
 
-    loadQueue();
+    loadAll();
+}
 
+
+async function approveAll() {
+
+    if (!confirm(
+        "Одобрить все Shorts со статусом ready?"
+    )) {
+        return;
+    }
+
+    const response = await fetch(
+        "/approve-all",
+        {
+            method: "POST"
+        }
+    );
+
+    const answer = await response.json();
+
+    alert(
+        "Одобрено Shorts: " + answer.count
+    );
+
+    loadAll();
 }
 
 
@@ -652,17 +924,20 @@ async function deleteShort(id) {
         }
     );
 
-    loadQueue();
-
+    loadAll();
 }
 
 
-loadQueue();
+async function loadAll() {
+    await loadStats();
+    await loadQueue();
+}
 
+
+loadAll();
 
 </script>
 
 </body>
-
 </html>
 """
