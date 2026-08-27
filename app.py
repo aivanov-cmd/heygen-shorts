@@ -1,10 +1,10 @@
 import os
 import psycopg2
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 
 
 app = FastAPI(title="HeyGen Shorts Generator")
@@ -24,6 +24,8 @@ VOICE_ID = "ba1544b5eae84eae9cb92598f078b6b0"
 
 MAX_DAILY_VIDEOS = 30
 
+INTERNAL_API_KEY = os.environ.get("INTERNAL_API_KEY")
+
 
 # ============================================================
 # DATABASE
@@ -42,9 +44,6 @@ def init_db():
     conn = get_db()
     cur = conn.cursor()
 
-    # Новая таблица для чистой установки.
-    # Старые обязательные колонки остаются здесь, потому что существующая
-    # production-база была создана по старой схеме.
     cur.execute("""
         CREATE TABLE IF NOT EXISTS shorts (
             id SERIAL PRIMARY KEY,
@@ -76,7 +75,6 @@ def init_db():
         )
     """)
 
-    # Безопасно добавляем новые поля в старую БД.
     cur.execute("""
         ALTER TABLE shorts
         ADD COLUMN IF NOT EXISTS script TEXT
@@ -97,50 +95,27 @@ def init_db():
         ADD COLUMN IF NOT EXISTS last_error TEXT
     """)
 
-    # ВАЖНО:
-    # В старой таблице эти поля NOT NULL без DEFAULT.
-    # Поэтому задаём DEFAULT, чтобы новые записи больше
-    # не были обязаны содержать 3 сцены и 3 аватара.
+    # Старые NOT NULL поля оставляем в БД,
+    # но новые записи больше не обязаны их передавать.
 
-    cur.execute("""
-        ALTER TABLE shorts
-        ALTER COLUMN scene_1 SET DEFAULT ''
-    """)
+    old_columns = [
+        "scene_1",
+        "scene_2",
+        "scene_3",
+        "avatar_1",
+        "avatar_2",
+        "avatar_3",
+        "voice_id",
+        "template_id",
+    ]
 
-    cur.execute("""
-        ALTER TABLE shorts
-        ALTER COLUMN scene_2 SET DEFAULT ''
-    """)
-
-    cur.execute("""
-        ALTER TABLE shorts
-        ALTER COLUMN scene_3 SET DEFAULT ''
-    """)
-
-    cur.execute("""
-        ALTER TABLE shorts
-        ALTER COLUMN avatar_1 SET DEFAULT ''
-    """)
-
-    cur.execute("""
-        ALTER TABLE shorts
-        ALTER COLUMN avatar_2 SET DEFAULT ''
-    """)
-
-    cur.execute("""
-        ALTER TABLE shorts
-        ALTER COLUMN avatar_3 SET DEFAULT ''
-    """)
-
-    cur.execute("""
-        ALTER TABLE shorts
-        ALTER COLUMN voice_id SET DEFAULT ''
-    """)
-
-    cur.execute("""
-        ALTER TABLE shorts
-        ALTER COLUMN template_id SET DEFAULT ''
-    """)
+    for column in old_columns:
+        cur.execute(
+            f"""
+            ALTER TABLE shorts
+            ALTER COLUMN {column} SET DEFAULT ''
+            """
+        )
 
     conn.commit()
     cur.close()
@@ -170,6 +145,40 @@ class ShortUpdate(BaseModel):
     script: str
 
 
+class CompleteRequest(BaseModel):
+    heygen_video_id: str
+    video_url: str
+    subtitle_url: Optional[str] = None
+
+
+class FailRequest(BaseModel):
+    error: str
+
+
+# ============================================================
+# SECURITY
+# ============================================================
+
+def verify_internal_key(x_internal_key: Optional[str]):
+    if not INTERNAL_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="INTERNAL_API_KEY is not configured"
+        )
+
+    if not x_internal_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing internal API key"
+        )
+
+    if x_internal_key != INTERNAL_API_KEY:
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid internal API key"
+        )
+
+
 # ============================================================
 # HELPERS
 # ============================================================
@@ -193,16 +202,6 @@ def validate_short(topic: str, script: str):
 
 
 def get_next_avatar():
-    """
-    Выбираем Look по кругу на основании количества записей.
-    Для нашей задачи:
-    1 -> Look 1
-    2 -> Look 2
-    3 -> Look 3
-    4 -> Look 1
-    ...
-    """
-
     conn = get_db()
     cur = conn.cursor()
 
@@ -280,7 +279,8 @@ def health():
         return {
             "status": "ok",
             "database": "connected",
-            "mode": "single_avatar_mcp"
+            "mode": "single_avatar_mcp",
+            "internal_api_key_configured": bool(INTERNAL_API_KEY)
         }
 
     except Exception as error:
@@ -714,6 +714,210 @@ def delete_short(short_id: int):
 
 
 # ============================================================
+# INTERNAL: START GENERATION
+# ============================================================
+
+@app.post("/internal/shorts/{short_id}/start")
+def start_generation(
+    short_id: int,
+    x_internal_key: Optional[str] = Header(
+        default=None,
+        alias="X-Internal-Key"
+    )
+):
+    verify_internal_key(x_internal_key)
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        UPDATE shorts
+        SET
+            status = 'generating',
+            last_error = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = %s
+          AND status = 'approved'
+          AND heygen_video_id IS NULL
+        RETURNING
+            id,
+            topic,
+            script,
+            avatar_id,
+            voice_id
+        """,
+        (short_id,)
+    )
+
+    row = cur.fetchone()
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    if not row:
+        raise HTTPException(
+            status_code=409,
+            detail="Short is not available for generation"
+        )
+
+    return {
+        "id": row[0],
+        "topic": row[1],
+        "script": row[2],
+        "avatar_id": row[3],
+        "voice_id": row[4],
+        "status": "generating"
+    }
+
+
+# ============================================================
+# INTERNAL: COMPLETE GENERATION
+# ============================================================
+
+@app.post("/internal/shorts/{short_id}/complete")
+def complete_generation(
+    short_id: int,
+    request: CompleteRequest,
+    x_internal_key: Optional[str] = Header(
+        default=None,
+        alias="X-Internal-Key"
+    )
+):
+    verify_internal_key(x_internal_key)
+
+    if not clean_text(request.heygen_video_id):
+        raise HTTPException(
+            status_code=400,
+            detail="heygen_video_id cannot be empty"
+        )
+
+    if not clean_text(request.video_url):
+        raise HTTPException(
+            status_code=400,
+            detail="video_url cannot be empty"
+        )
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        UPDATE shorts
+        SET
+            status = 'completed',
+            heygen_video_id = %s,
+            video_url = %s,
+            subtitle_url = %s,
+            last_error = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = %s
+          AND status = 'generating'
+        RETURNING id
+        """,
+        (
+            clean_text(request.heygen_video_id),
+            clean_text(request.video_url),
+            (
+                clean_text(request.subtitle_url)
+                if request.subtitle_url
+                else None
+            ),
+            short_id
+        )
+    )
+
+    result = cur.fetchone()
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    if not result:
+        raise HTTPException(
+            status_code=409,
+            detail="Short is not currently generating"
+        )
+
+    return {
+        "id": short_id,
+        "status": "completed",
+        "heygen_video_id": clean_text(
+            request.heygen_video_id
+        ),
+        "video_url": clean_text(
+            request.video_url
+        ),
+        "subtitle_url": (
+            clean_text(request.subtitle_url)
+            if request.subtitle_url
+            else None
+        )
+    }
+
+
+# ============================================================
+# INTERNAL: FAILED GENERATION
+# ============================================================
+
+@app.post("/internal/shorts/{short_id}/fail")
+def fail_generation(
+    short_id: int,
+    request: FailRequest,
+    x_internal_key: Optional[str] = Header(
+        default=None,
+        alias="X-Internal-Key"
+    )
+):
+    verify_internal_key(x_internal_key)
+
+    if not clean_text(request.error):
+        raise HTTPException(
+            status_code=400,
+            detail="Error cannot be empty"
+        )
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        UPDATE shorts
+        SET
+            status = 'failed',
+            last_error = %s,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = %s
+          AND status = 'generating'
+        RETURNING id
+        """,
+        (
+            clean_text(request.error),
+            short_id
+        )
+    )
+
+    result = cur.fetchone()
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    if not result:
+        raise HTTPException(
+            status_code=409,
+            detail="Short is not currently generating"
+        )
+
+    return {
+        "id": short_id,
+        "status": "failed",
+        "error": clean_text(request.error)
+    }
+
+
+# ============================================================
 # PANEL
 # ============================================================
 
@@ -833,6 +1037,18 @@ button {
     font-weight: bold;
 }
 
+.error {
+    padding: 10px;
+    margin-top: 10px;
+    background: #fff;
+    border: 1px solid #e57373;
+    border-radius: 6px;
+}
+
+.video-link {
+    margin-top: 12px;
+}
+
 </style>
 </head>
 
@@ -863,16 +1079,16 @@ button {
 <h2>Добавить Shorts</h2>
 
 <p>
-Пока вставляем пакет topic + script.
-Позже ChatGPT будет отправлять его сюда автоматически через MCP.
+Вставь пакет topic + script.
+Генерация HeyGen из этой панели пока не запускается.
 </p>
 
 <textarea id="input">
 {
   "shorts": [
     {
-      "topic": "Почему хорошие связки перестают работать",
-      "script": "Даже прибыльная связка не работает вечно. Это пример полного сценария одного Shorts."
+      "topic": "Тема ролика",
+      "script": "Полный сценарий одного Shorts."
     }
   ]
 }
@@ -904,7 +1120,6 @@ button {
 <script>
 
 function escapeHtml(text) {
-
     return String(text ?? "")
         .replaceAll("&", "&amp;")
         .replaceAll("<", "&lt;")
@@ -914,12 +1129,10 @@ function escapeHtml(text) {
 
 
 async function sendBatch() {
-
     const message =
         document.getElementById("message");
 
     try {
-
         const data = JSON.parse(
             document.getElementById("input").value
         );
@@ -937,8 +1150,7 @@ async function sendBatch() {
             }
         );
 
-        const answer =
-            await response.json();
+        const answer = await response.json();
 
         if (!response.ok) {
             throw new Error(
@@ -952,7 +1164,6 @@ async function sendBatch() {
         await loadAll();
 
     } catch (error) {
-
         message.textContent =
             "Ошибка: " + error.message;
     }
@@ -960,7 +1171,6 @@ async function sendBatch() {
 
 
 async function loadStats() {
-
     const response =
         await fetch("/stats");
 
@@ -978,7 +1188,6 @@ async function loadStats() {
 
 
 async function loadQueue() {
-
     const response =
         await fetch("/queue");
 
@@ -991,7 +1200,6 @@ async function loadQueue() {
     container.innerHTML = "";
 
     data.shorts.forEach(short => {
-
         const item =
             document.createElement("div");
 
@@ -1002,10 +1210,11 @@ async function loadQueue() {
 
         if (short.video_url) {
             video = `
-                <p>
+                <p class="video-link">
                     <a
-                        href="${short.video_url}"
+                        href="${escapeHtml(short.video_url)}"
                         target="_blank"
+                        rel="noopener noreferrer"
                     >
                         Открыть видео
                     </a>
@@ -1017,10 +1226,10 @@ async function loadQueue() {
 
         if (short.last_error) {
             error = `
-                <p>
+                <div class="error">
                     <strong>Ошибка:</strong>
                     ${escapeHtml(short.last_error)}
-                </p>
+                </div>
             `;
         }
 
@@ -1070,6 +1279,16 @@ async function loadQueue() {
             `;
         }
 
+        let heygenMeta = "";
+
+        if (short.heygen_video_id) {
+            heygenMeta = `
+                <br>
+                HeyGen Video ID:
+                ${escapeHtml(short.heygen_video_id)}
+            `;
+        }
+
         item.innerHTML = `
 
             <h3>
@@ -1078,7 +1297,8 @@ async function loadQueue() {
             </h3>
 
             <p class="status">
-                Статус: ${escapeHtml(short.status)}
+                Статус:
+                ${escapeHtml(short.status)}
             </p>
 
             <div class="script">
@@ -1091,6 +1311,7 @@ async function loadQueue() {
                 <br>
                 Voice ID:
                 ${escapeHtml(short.voice_id || "—")}
+                ${heygenMeta}
             </div>
 
             ${video}
@@ -1107,18 +1328,14 @@ async function loadQueue() {
                 id="edit-${short.id}"
             >
 
-                <label>
-                    Тема
-                </label>
+                <label>Тема</label>
 
                 <input
                     id="topic-${short.id}"
                     value="${escapeHtml(short.topic)}"
                 >
 
-                <label>
-                    Полный script
-                </label>
+                <label>Полный script</label>
 
                 <textarea
                     id="script-${short.id}"
@@ -1145,7 +1362,6 @@ async function loadQueue() {
 
 
 function showEdit(id) {
-
     document.getElementById(
         "edit-" + id
     ).style.display = "block";
@@ -1153,7 +1369,6 @@ function showEdit(id) {
 
 
 function hideEdit(id) {
-
     document.getElementById(
         "edit-" + id
     ).style.display = "none";
@@ -1161,9 +1376,7 @@ function hideEdit(id) {
 
 
 async function saveEdit(id) {
-
     const body = {
-
         topic:
             document.getElementById(
                 "topic-" + id
@@ -1191,7 +1404,6 @@ async function saveEdit(id) {
         await response.json();
 
     if (!response.ok) {
-
         alert(
             answer.detail ||
             "Ошибка сохранения"
@@ -1205,7 +1417,6 @@ async function saveEdit(id) {
 
 
 async function approveShort(id) {
-
     const response = await fetch(
         "/shorts/" + id + "/approve",
         {
@@ -1217,7 +1428,6 @@ async function approveShort(id) {
         await response.json();
 
     if (!response.ok) {
-
         alert(
             answer.detail ||
             "Ошибка"
@@ -1231,7 +1441,6 @@ async function approveShort(id) {
 
 
 async function approveAll() {
-
     if (!confirm(
         "Одобрить все Shorts со статусом ready?"
     )) {
@@ -1249,7 +1458,6 @@ async function approveAll() {
         await response.json();
 
     if (!response.ok) {
-
         alert(
             answer.detail ||
             "Ошибка"
@@ -1268,7 +1476,6 @@ async function approveAll() {
 
 
 async function deleteShort(id) {
-
     if (!confirm(
         "Удалить этот Shorts?"
     )) {
@@ -1286,7 +1493,6 @@ async function deleteShort(id) {
         await response.json();
 
     if (!response.ok) {
-
         alert(
             answer.detail ||
             "Ошибка удаления"
@@ -1300,7 +1506,6 @@ async function deleteShort(id) {
 
 
 async function loadAll() {
-
     await loadStats();
     await loadQueue();
 }
