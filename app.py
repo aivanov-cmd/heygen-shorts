@@ -6,7 +6,8 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import List, Optional
 
-from mcp.server.fastmcp import FastMCP
+
+app = FastAPI(title="HeyGen Shorts Generator")
 
 
 # ============================================================
@@ -118,223 +119,9 @@ def init_db():
     conn.close()
 
 
-# ============================================================
-# DATABASE HELPERS
-# ============================================================
-
-def fetch_stats():
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT status, COUNT(*)
-        FROM shorts
-        GROUP BY status
-    """)
-
-    rows = cur.fetchall()
-
-    cur.close()
-    conn.close()
-
-    stats = {
-        "ready": 0,
-        "approved": 0,
-        "generating": 0,
-        "completed": 0,
-        "failed": 0,
-    }
-
-    total = 0
-
-    for status, count in rows:
-        stats[status] = count
-        total += count
-
-    return {
-        "total": total,
-        **stats
-    }
-
-
-def fetch_approved_shorts(limit=30):
-    limit = max(1, min(limit, MAX_DAILY_VIDEOS))
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT
-            id,
-            topic,
-            script,
-            avatar_id,
-            voice_id,
-            status
-        FROM shorts
-        WHERE status = 'approved'
-          AND heygen_video_id IS NULL
-        ORDER BY id ASC
-        LIMIT %s
-        """,
-        (limit,)
-    )
-
-    rows = cur.fetchall()
-
-    cur.close()
-    conn.close()
-
-    result = []
-
-    for row in rows:
-        result.append({
-            "id": row[0],
-            "topic": row[1],
-            "script": row[2],
-            "avatar_id": row[3],
-            "voice_id": row[4],
-            "status": row[5],
-        })
-
-    return result
-
-
-def fetch_short(short_id):
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT
-            id,
-            topic,
-            script,
-            avatar_id,
-            voice_id,
-            status,
-            heygen_video_id,
-            video_url,
-            subtitle_url,
-            last_error,
-            created_at,
-            updated_at
-        FROM shorts
-        WHERE id = %s
-        """,
-        (short_id,)
-    )
-
-    row = cur.fetchone()
-
-    cur.close()
-    conn.close()
-
-    if not row:
-        return None
-
-    return {
-        "id": row[0],
-        "topic": row[1],
-        "script": row[2],
-        "avatar_id": row[3],
-        "voice_id": row[4],
-        "status": row[5],
-        "heygen_video_id": row[6],
-        "video_url": row[7],
-        "subtitle_url": row[8],
-        "last_error": row[9],
-        "created_at": str(row[10]),
-        "updated_at": str(row[11]),
-    }
-
-
-# ============================================================
-# MCP SERVER
-# ============================================================
-
-mcp = FastMCP(
-    "HeyGen Shorts Queue",
-    stateless_http=True
-)
-
-
-@mcp.tool()
-def get_approved_shorts(limit: int = 30) -> dict:
-    """
-    Get approved Shorts that are waiting for HeyGen generation.
-
-    This tool is read-only.
-    It does not change statuses and does not call HeyGen.
-    """
-
-    shorts = fetch_approved_shorts(limit)
-
-    return {
-        "count": len(shorts),
-        "shorts": shorts
-    }
-
-
-@mcp.tool()
-def get_short(short_id: int) -> dict:
-    """
-    Get one Short from the Railway queue by ID.
-
-    This tool is read-only.
-    """
-
-    short = fetch_short(short_id)
-
-    if not short:
-        return {
-            "found": False,
-            "error": "Short not found"
-        }
-
-    return {
-        "found": True,
-        "short": short
-    }
-
-
-@mcp.tool()
-def get_queue_stats() -> dict:
-    """
-    Get current statistics for the Shorts queue.
-
-    This tool is read-only.
-    """
-
-    return fetch_stats()
-
-
-# ============================================================
-# MCP ASGI APPLICATION
-# ============================================================
-
-mcp_app = mcp.streamable_http_app()
-
-
-# ============================================================
-# FASTAPI
-# ============================================================
-
-app = FastAPI(
-    title="HeyGen Shorts Generator",
-    lifespan=mcp_app.lifespan
-)
-
-
-# Mount MCP.
-#
-# Because FastMCP's Streamable HTTP app itself uses /mcp,
-# mounting it at "/" exposes the public MCP endpoint at:
-#
-# https://YOUR-DOMAIN/mcp
-
-app.mount("/", mcp_app)
+@app.on_event("startup")
+def startup():
+    init_db()
 
 
 # ============================================================
@@ -470,8 +257,7 @@ def home():
     return {
         "service": "HeyGen Shorts",
         "status": "working",
-        "mode": "single_avatar_mcp",
-        "mcp": "/mcp"
+        "mode": "single_avatar_mcp"
     }
 
 
@@ -491,9 +277,7 @@ def health():
             "status": "ok",
             "database": "connected",
             "mode": "single_avatar_mcp",
-            "internal_api_key_configured": bool(INTERNAL_API_KEY),
-            "mcp_enabled": True,
-            "mcp_endpoint": "/mcp"
+            "internal_api_key_configured": bool(INTERNAL_API_KEY)
         }
 
     except Exception as error:
@@ -619,16 +403,56 @@ def get_queue():
 # ============================================================
 
 @app.get("/shorts/{short_id}")
-def get_short_http(short_id: int):
-    short = fetch_short(short_id)
+def get_short(short_id: int):
+    conn = get_db()
+    cur = conn.cursor()
 
-    if not short:
+    cur.execute(
+        """
+        SELECT
+            id,
+            topic,
+            script,
+            avatar_id,
+            voice_id,
+            status,
+            heygen_video_id,
+            video_url,
+            subtitle_url,
+            last_error,
+            created_at,
+            updated_at
+        FROM shorts
+        WHERE id = %s
+        """,
+        (short_id,)
+    )
+
+    row = cur.fetchone()
+
+    cur.close()
+    conn.close()
+
+    if not row:
         raise HTTPException(
             status_code=404,
             detail="Short not found"
         )
 
-    return short
+    return {
+        "id": row[0],
+        "topic": row[1],
+        "script": row[2],
+        "avatar_id": row[3],
+        "voice_id": row[4],
+        "status": row[5],
+        "heygen_video_id": row[6],
+        "video_url": row[7],
+        "subtitle_url": row[8],
+        "last_error": row[9],
+        "created_at": str(row[10]),
+        "updated_at": str(row[11])
+    }
 
 
 # ============================================================
@@ -637,11 +461,53 @@ def get_short_http(short_id: int):
 
 @app.get("/queue/approved")
 def get_approved_queue(limit: int = 30):
-    shorts = fetch_approved_shorts(limit)
+    if limit < 1:
+        limit = 1
+
+    if limit > MAX_DAILY_VIDEOS:
+        limit = MAX_DAILY_VIDEOS
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT
+            id,
+            topic,
+            script,
+            avatar_id,
+            voice_id,
+            status
+        FROM shorts
+        WHERE status = 'approved'
+          AND heygen_video_id IS NULL
+        ORDER BY id ASC
+        LIMIT %s
+        """,
+        (limit,)
+    )
+
+    rows = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    result = []
+
+    for row in rows:
+        result.append({
+            "id": row[0],
+            "topic": row[1],
+            "script": row[2],
+            "avatar_id": row[3],
+            "voice_id": row[4],
+            "status": row[5]
+        })
 
     return {
-        "count": len(shorts),
-        "shorts": shorts
+        "count": len(result),
+        "shorts": result
     }
 
 
@@ -651,7 +517,38 @@ def get_approved_queue(limit: int = 30):
 
 @app.get("/stats")
 def get_stats():
-    return fetch_stats()
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT status, COUNT(*)
+        FROM shorts
+        GROUP BY status
+    """)
+
+    rows = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    stats = {
+        "ready": 0,
+        "approved": 0,
+        "generating": 0,
+        "completed": 0,
+        "failed": 0
+    }
+
+    total = 0
+
+    for status, count in rows:
+        stats[status] = count
+        total += count
+
+    return {
+        "total": total,
+        **stats
+    }
 
 
 # ============================================================
@@ -814,7 +711,7 @@ def delete_short(short_id: int):
 
 
 # ============================================================
-# INTERNAL: START GENERATION
+# INTERNAL: START
 # ============================================================
 
 @app.post("/internal/shorts/{short_id}/start")
@@ -873,7 +770,7 @@ def start_generation(
 
 
 # ============================================================
-# INTERNAL: COMPLETE GENERATION
+# INTERNAL: COMPLETE
 # ============================================================
 
 @app.post("/internal/shorts/{short_id}/complete")
@@ -919,9 +816,11 @@ def complete_generation(
         (
             clean_text(request.heygen_video_id),
             clean_text(request.video_url),
-            clean_text(request.subtitle_url)
-            if request.subtitle_url
-            else None,
+            (
+                clean_text(request.subtitle_url)
+                if request.subtitle_url
+                else None
+            ),
             short_id
         )
     )
@@ -956,7 +855,7 @@ def complete_generation(
 
 
 # ============================================================
-# INTERNAL: FAILED GENERATION
+# INTERNAL: FAIL
 # ============================================================
 
 @app.post("/internal/shorts/{short_id}/fail")
@@ -1021,15 +920,39 @@ def fail_generation(
 
 @app.get("/dry-run/next")
 def dry_run_next():
-    shorts = fetch_approved_shorts(1)
+    conn = get_db()
+    cur = conn.cursor()
 
-    if not shorts:
+    cur.execute("""
+        SELECT
+            id,
+            topic,
+            script,
+            avatar_id,
+            voice_id
+        FROM shorts
+        WHERE status = 'approved'
+          AND heygen_video_id IS NULL
+        ORDER BY id ASC
+        LIMIT 1
+    """)
+
+    row = cur.fetchone()
+
+    cur.close()
+    conn.close()
+
+    if not row:
         return {
             "status": "empty",
             "message": "No approved Shorts available"
         }
 
-    short = shorts[0]
+    short_id = row[0]
+    topic = row[1]
+    script = row[2]
+    avatar_id = row[3]
+    voice_id = row[4]
 
     return {
         "status": "dry_run",
@@ -1037,21 +960,19 @@ def dry_run_next():
         "credits_used": False,
 
         "short": {
-            "id": short["id"],
-            "topic": short["topic"]
+            "id": short_id,
+            "topic": topic
         },
 
         "heygen_payload": {
-            "title": (
-                f'Short #{short["id"]} - '
-                f'{short["topic"]}'
-            ),
-            "avatarId": short["avatar_id"],
-            "voiceId": short["voice_id"],
-            "script": short["script"],
+            "title": f"Short #{short_id} - {topic}",
+            "avatarId": avatar_id,
+            "voiceId": voice_id,
+            "script": script,
             "aspectRatio": "9:16",
             "resolution": "1080p",
             "outputFormat": "mp4",
+
             "caption": {
                 "enabled": True,
                 "file_format": "srt",
@@ -1072,12 +993,8 @@ def panel():
 <html lang="ru">
 
 <head>
-
 <meta charset="UTF-8">
-<meta
-    name="viewport"
-    content="width=device-width, initial-scale=1.0"
->
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 
 <title>HeyGen Shorts</title>
 
@@ -1194,7 +1111,6 @@ button {
 }
 
 </style>
-
 </head>
 
 <body>
@@ -1225,6 +1141,7 @@ button {
 
 <p>
 Вставь пакет topic + script.
+Генерация HeyGen из этой панели пока не запускается.
 </p>
 
 <textarea id="input">
