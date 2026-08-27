@@ -11,18 +11,18 @@ app = FastAPI(title="HeyGen Shorts Generator")
 
 
 # ============================================================
-# НАСТРОЙКИ
+# CONFIG
 # ============================================================
 
-AVATAR_1 = "f2813391b4a74544bd18d0b22c2251c0"
-AVATAR_2 = "edd35073c03b4af2a8ddb07b0c62e9cc"
-AVATAR_3 = "31c27d30df2d447089cd1fb41e58959e"
+AVATARS = [
+    "f2813391b4a74544bd18d0b22c2251c0",
+    "edd35073c03b4af2a8ddb07b0c62e9cc",
+    "31c27d30df2d447089cd1fb41e58959e",
+]
 
 VOICE_ID = "ba1544b5eae84eae9cb92598f078b6b0"
-TEMPLATE_ID = "2596b61c4be848bf90b321ab6ebdb158"
 
 MAX_DAILY_VIDEOS = 30
-RENDER_ENABLED = False
 
 
 # ============================================================
@@ -42,22 +42,24 @@ def init_db():
     conn = get_db()
     cur = conn.cursor()
 
-    # Старая структура сохраняется для совместимости.
+    # Новая таблица для чистой установки.
+    # Старые обязательные колонки остаются здесь, потому что существующая
+    # production-база была создана по старой схеме.
     cur.execute("""
         CREATE TABLE IF NOT EXISTS shorts (
             id SERIAL PRIMARY KEY,
             topic TEXT NOT NULL,
 
-            scene_1 TEXT NOT NULL,
-            scene_2 TEXT NOT NULL,
-            scene_3 TEXT NOT NULL,
+            scene_1 TEXT NOT NULL DEFAULT '',
+            scene_2 TEXT NOT NULL DEFAULT '',
+            scene_3 TEXT NOT NULL DEFAULT '',
 
-            avatar_1 TEXT NOT NULL,
-            avatar_2 TEXT NOT NULL,
-            avatar_3 TEXT NOT NULL,
+            avatar_1 TEXT NOT NULL DEFAULT '',
+            avatar_2 TEXT NOT NULL DEFAULT '',
+            avatar_3 TEXT NOT NULL DEFAULT '',
 
-            voice_id TEXT NOT NULL,
-            template_id TEXT NOT NULL,
+            voice_id TEXT NOT NULL DEFAULT '',
+            template_id TEXT NOT NULL DEFAULT '',
 
             status TEXT NOT NULL DEFAULT 'ready',
 
@@ -65,15 +67,16 @@ def init_db():
             video_url TEXT,
 
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+            script TEXT,
+            avatar_id TEXT,
+            subtitle_url TEXT,
+            last_error TEXT
         )
     """)
 
-    # --------------------------------------------------------
-    # Новые поля для будущей схемы:
-    # 1 Shorts = 1 script + 1 avatar
-    # --------------------------------------------------------
-
+    # Безопасно добавляем новые поля в старую БД.
     cur.execute("""
         ALTER TABLE shorts
         ADD COLUMN IF NOT EXISTS script TEXT
@@ -94,26 +97,52 @@ def init_db():
         ADD COLUMN IF NOT EXISTS last_error TEXT
     """)
 
-    # Старые записи не теряем.
-    # Собираем их три сцены в один script.
+    # ВАЖНО:
+    # В старой таблице эти поля NOT NULL без DEFAULT.
+    # Поэтому задаём DEFAULT, чтобы новые записи больше
+    # не были обязаны содержать 3 сцены и 3 аватара.
+
     cur.execute("""
-        UPDATE shorts
-        SET script = CONCAT_WS(' ', scene_1, scene_2, scene_3)
-        WHERE script IS NULL
+        ALTER TABLE shorts
+        ALTER COLUMN scene_1 SET DEFAULT ''
     """)
 
-    # Старым записям временно назначаем первый Look.
-    cur.execute(
-        """
-        UPDATE shorts
-        SET avatar_id = %s
-        WHERE avatar_id IS NULL
-        """,
-        (AVATAR_1,)
-    )
+    cur.execute("""
+        ALTER TABLE shorts
+        ALTER COLUMN scene_2 SET DEFAULT ''
+    """)
+
+    cur.execute("""
+        ALTER TABLE shorts
+        ALTER COLUMN scene_3 SET DEFAULT ''
+    """)
+
+    cur.execute("""
+        ALTER TABLE shorts
+        ALTER COLUMN avatar_1 SET DEFAULT ''
+    """)
+
+    cur.execute("""
+        ALTER TABLE shorts
+        ALTER COLUMN avatar_2 SET DEFAULT ''
+    """)
+
+    cur.execute("""
+        ALTER TABLE shorts
+        ALTER COLUMN avatar_3 SET DEFAULT ''
+    """)
+
+    cur.execute("""
+        ALTER TABLE shorts
+        ALTER COLUMN voice_id SET DEFAULT ''
+    """)
+
+    cur.execute("""
+        ALTER TABLE shorts
+        ALTER COLUMN template_id SET DEFAULT ''
+    """)
 
     conn.commit()
-
     cur.close()
     conn.close()
 
@@ -127,33 +156,112 @@ def startup():
 # MODELS
 # ============================================================
 
-class ShortsRequest(BaseModel):
+class ShortRequest(BaseModel):
     topic: str
-    scene_1: str
-    scene_2: str
-    scene_3: str
+    script: str
 
 
 class BatchRequest(BaseModel):
-    shorts: List[ShortsRequest]
+    shorts: List[ShortRequest]
 
 
-class ShortsUpdate(BaseModel):
+class ShortUpdate(BaseModel):
     topic: str
-    scene_1: str
-    scene_2: str
-    scene_3: str
+    script: str
 
 
 # ============================================================
-# HEALTH
+# HELPERS
+# ============================================================
+
+def clean_text(value: str):
+    return value.strip()
+
+
+def validate_short(topic: str, script: str):
+    if not clean_text(topic):
+        raise HTTPException(
+            status_code=400,
+            detail="Topic cannot be empty"
+        )
+
+    if not clean_text(script):
+        raise HTTPException(
+            status_code=400,
+            detail="Script cannot be empty"
+        )
+
+
+def get_next_avatar():
+    """
+    Выбираем Look по кругу на основании количества записей.
+    Для нашей задачи:
+    1 -> Look 1
+    2 -> Look 2
+    3 -> Look 3
+    4 -> Look 1
+    ...
+    """
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) FROM shorts")
+    count = cur.fetchone()[0]
+
+    cur.close()
+    conn.close()
+
+    return AVATARS[count % len(AVATARS)]
+
+
+def save_short(short: ShortRequest):
+    validate_short(short.topic, short.script)
+
+    avatar_id = get_next_avatar()
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        INSERT INTO shorts (
+            topic,
+            script,
+            avatar_id,
+            voice_id,
+            status
+        )
+        VALUES (%s, %s, %s, %s, 'ready')
+        RETURNING id
+        """,
+        (
+            clean_text(short.topic),
+            clean_text(short.script),
+            avatar_id,
+            VOICE_ID
+        )
+    )
+
+    short_id = cur.fetchone()[0]
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return short_id, avatar_id
+
+
+# ============================================================
+# HOME / HEALTH
 # ============================================================
 
 @app.get("/")
 def home():
     return {
         "service": "HeyGen Shorts",
-        "status": "working"
+        "status": "working",
+        "mode": "single_avatar_mcp"
     }
 
 
@@ -171,7 +279,8 @@ def health():
 
         return {
             "status": "ok",
-            "database": "connected"
+            "database": "connected",
+            "mode": "single_avatar_mcp"
         }
 
     except Exception as error:
@@ -183,103 +292,18 @@ def health():
 
 
 # ============================================================
-# HEYGEN CONFIG
-# ============================================================
-
-@app.get("/heygen-config")
-def heygen_config():
-    return {
-        "status": "mcp_mode",
-        "template_id": TEMPLATE_ID,
-        "billing_mode_required": "web_plan_oauth",
-        "render_enabled": RENDER_ENABLED
-    }
-
-
-# ============================================================
-# SAVE SHORT
-# ============================================================
-
-def save_short(short: ShortsRequest):
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        INSERT INTO shorts (
-            topic,
-
-            scene_1,
-            scene_2,
-            scene_3,
-
-            avatar_1,
-            avatar_2,
-            avatar_3,
-
-            voice_id,
-            template_id,
-
-            script,
-            avatar_id,
-
-            status
-        )
-        VALUES (
-            %s, %s, %s, %s,
-            %s, %s, %s,
-            %s, %s,
-            %s, %s,
-            'ready'
-        )
-        RETURNING id
-        """,
-        (
-            short.topic,
-
-            short.scene_1,
-            short.scene_2,
-            short.scene_3,
-
-            AVATAR_1,
-            AVATAR_2,
-            AVATAR_3,
-
-            VOICE_ID,
-            TEMPLATE_ID,
-
-            " ".join([
-                short.scene_1,
-                short.scene_2,
-                short.scene_3
-            ]),
-
-            AVATAR_1
-        )
-    )
-
-    short_id = cur.fetchone()[0]
-
-    conn.commit()
-
-    cur.close()
-    conn.close()
-
-    return short_id
-
-
-# ============================================================
-# CREATE ONE SHORT
+# CREATE ONE
 # ============================================================
 
 @app.post("/shorts")
-def create_short(short: ShortsRequest):
-    short_id = save_short(short)
+def create_short(short: ShortRequest):
+    short_id, avatar_id = save_short(short)
 
     return {
         "status": "ready",
         "id": short_id,
-        "topic": short.topic
+        "topic": clean_text(short.topic),
+        "avatar_id": avatar_id
     }
 
 
@@ -289,7 +313,7 @@ def create_short(short: ShortsRequest):
 
 @app.post("/batch")
 def create_batch(request: BatchRequest):
-    if len(request.shorts) == 0:
+    if not request.shorts:
         raise HTTPException(
             status_code=400,
             detail="No shorts supplied"
@@ -304,11 +328,12 @@ def create_batch(request: BatchRequest):
     created = []
 
     for short in request.shorts:
-        short_id = save_short(short)
+        short_id, avatar_id = save_short(short)
 
         created.append({
             "id": short_id,
-            "topic": short.topic,
+            "topic": clean_text(short.topic),
+            "avatar_id": avatar_id,
             "status": "ready"
         })
 
@@ -332,21 +357,16 @@ def get_queue():
         SELECT
             id,
             topic,
-
-            scene_1,
-            scene_2,
-            scene_3,
-
+            script,
+            avatar_id,
+            voice_id,
             status,
             heygen_video_id,
             video_url,
-            created_at,
-
-            script,
-            avatar_id,
             subtitle_url,
-            last_error
-
+            last_error,
+            created_at,
+            updated_at
         FROM shorts
         ORDER BY id DESC
         LIMIT 200
@@ -363,20 +383,129 @@ def get_queue():
         result.append({
             "id": row[0],
             "topic": row[1],
-
-            "scene_1": row[2],
-            "scene_2": row[3],
-            "scene_3": row[4],
-
+            "script": row[2],
+            "avatar_id": row[3],
+            "voice_id": row[4],
             "status": row[5],
             "heygen_video_id": row[6],
             "video_url": row[7],
-            "created_at": str(row[8]),
+            "subtitle_url": row[8],
+            "last_error": row[9],
+            "created_at": str(row[10]),
+            "updated_at": str(row[11])
+        })
 
-            "script": row[9],
-            "avatar_id": row[10],
-            "subtitle_url": row[11],
-            "last_error": row[12]
+    return {
+        "count": len(result),
+        "shorts": result
+    }
+
+
+# ============================================================
+# GET ONE
+# ============================================================
+
+@app.get("/shorts/{short_id}")
+def get_short(short_id: int):
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT
+            id,
+            topic,
+            script,
+            avatar_id,
+            voice_id,
+            status,
+            heygen_video_id,
+            video_url,
+            subtitle_url,
+            last_error,
+            created_at,
+            updated_at
+        FROM shorts
+        WHERE id = %s
+        """,
+        (short_id,)
+    )
+
+    row = cur.fetchone()
+
+    cur.close()
+    conn.close()
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="Short not found"
+        )
+
+    return {
+        "id": row[0],
+        "topic": row[1],
+        "script": row[2],
+        "avatar_id": row[3],
+        "voice_id": row[4],
+        "status": row[5],
+        "heygen_video_id": row[6],
+        "video_url": row[7],
+        "subtitle_url": row[8],
+        "last_error": row[9],
+        "created_at": str(row[10]),
+        "updated_at": str(row[11])
+    }
+
+
+# ============================================================
+# APPROVED QUEUE
+# ============================================================
+
+@app.get("/queue/approved")
+def get_approved_queue(limit: int = 30):
+    if limit < 1:
+        limit = 1
+
+    if limit > MAX_DAILY_VIDEOS:
+        limit = MAX_DAILY_VIDEOS
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT
+            id,
+            topic,
+            script,
+            avatar_id,
+            voice_id,
+            status
+        FROM shorts
+        WHERE status = 'approved'
+          AND heygen_video_id IS NULL
+        ORDER BY id ASC
+        LIMIT %s
+        """,
+        (limit,)
+    )
+
+    rows = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    result = []
+
+    for row in rows:
+        result.append({
+            "id": row[0],
+            "topic": row[1],
+            "script": row[2],
+            "avatar_id": row[3],
+            "voice_id": row[4],
+            "status": row[5]
         })
 
     return {
@@ -439,8 +568,11 @@ def approve_short(short_id: int):
         UPDATE shorts
         SET
             status = 'approved',
+            last_error = NULL,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = %s
+          AND status IN ('ready', 'failed')
+          AND heygen_video_id IS NULL
         RETURNING id
         """,
         (short_id,)
@@ -449,14 +581,13 @@ def approve_short(short_id: int):
     result = cur.fetchone()
 
     conn.commit()
-
     cur.close()
     conn.close()
 
     if not result:
         raise HTTPException(
-            status_code=404,
-            detail="Short not found"
+            status_code=409,
+            detail="Short cannot be approved"
         )
 
     return {
@@ -478,15 +609,16 @@ def approve_all():
         UPDATE shorts
         SET
             status = 'approved',
+            last_error = NULL,
             updated_at = CURRENT_TIMESTAMP
         WHERE status = 'ready'
+          AND heygen_video_id IS NULL
         RETURNING id
     """)
 
     rows = cur.fetchall()
 
     conn.commit()
-
     cur.close()
     conn.close()
 
@@ -497,46 +629,31 @@ def approve_all():
 
 
 # ============================================================
-# EDIT SHORT
+# EDIT
 # ============================================================
 
 @app.put("/shorts/{short_id}")
-def update_short(short_id: int, update: ShortsUpdate):
+def update_short(short_id: int, update: ShortUpdate):
+    validate_short(update.topic, update.script)
+
     conn = get_db()
     cur = conn.cursor()
-
-    full_script = " ".join([
-        update.scene_1,
-        update.scene_2,
-        update.scene_3
-    ])
 
     cur.execute(
         """
         UPDATE shorts
         SET
             topic = %s,
-
-            scene_1 = %s,
-            scene_2 = %s,
-            scene_3 = %s,
-
             script = %s,
-
             updated_at = CURRENT_TIMESTAMP
-
         WHERE id = %s
+          AND status IN ('ready', 'approved', 'failed')
+          AND heygen_video_id IS NULL
         RETURNING id
         """,
         (
-            update.topic,
-
-            update.scene_1,
-            update.scene_2,
-            update.scene_3,
-
-            full_script,
-
+            clean_text(update.topic),
+            clean_text(update.script),
             short_id
         )
     )
@@ -544,14 +661,13 @@ def update_short(short_id: int, update: ShortsUpdate):
     result = cur.fetchone()
 
     conn.commit()
-
     cur.close()
     conn.close()
 
     if not result:
         raise HTTPException(
-            status_code=404,
-            detail="Short not found"
+            status_code=409,
+            detail="Short cannot be edited"
         )
 
     return {
@@ -561,7 +677,7 @@ def update_short(short_id: int, update: ShortsUpdate):
 
 
 # ============================================================
-# DELETE SHORT
+# DELETE
 # ============================================================
 
 @app.delete("/shorts/{short_id}")
@@ -573,6 +689,7 @@ def delete_short(short_id: int):
         """
         DELETE FROM shorts
         WHERE id = %s
+          AND status NOT IN ('generating', 'completed')
         RETURNING id
         """,
         (short_id,)
@@ -581,36 +698,18 @@ def delete_short(short_id: int):
     result = cur.fetchone()
 
     conn.commit()
-
     cur.close()
     conn.close()
 
     if not result:
         raise HTTPException(
-            status_code=404,
-            detail="Short not found"
+            status_code=409,
+            detail="Short cannot be deleted"
         )
 
     return {
         "status": "deleted",
         "id": short_id
-    }
-
-
-# ============================================================
-# FUTURE GENERATE ENDPOINT
-# ============================================================
-
-@app.post("/generate-approved")
-def generate_approved():
-    if not RENDER_ENABLED:
-        raise HTTPException(
-            status_code=503,
-            detail="Rendering is handled through ChatGPT + HeyGen MCP"
-        )
-
-    return {
-        "status": "not_implemented_yet"
     }
 
 
@@ -626,51 +725,64 @@ def panel():
 
 <head>
 <meta charset="UTF-8">
-<title>HeyGen Shorts Generator</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>HeyGen Shorts</title>
 
 <style>
 
 body {
     font-family: Arial, sans-serif;
-    max-width: 1200px;
-    margin: 40px auto;
+    max-width: 1100px;
+    margin: 35px auto;
     padding: 20px;
+    color: #222;
 }
 
 h1 {
     margin-bottom: 5px;
 }
 
+.subtitle {
+    color: #666;
+    margin-top: 0;
+}
+
 .topbar {
-    margin: 20px 0;
-    padding: 15px;
-    background: #f6f6f6;
-    border-radius: 8px;
+    padding: 18px;
+    margin: 25px 0;
+    background: #f5f5f5;
+    border-radius: 10px;
+}
+
+textarea,
+input {
+    box-sizing: border-box;
+    width: 100%;
+    padding: 10px;
+    margin: 5px 0 10px 0;
 }
 
 textarea {
-    width: 100%;
     min-height: 120px;
+}
+
+#input {
+    min-height: 280px;
     font-family: monospace;
-    padding: 10px;
 }
 
 button {
-    padding: 10px 16px;
+    padding: 9px 14px;
     margin: 5px 5px 5px 0;
     cursor: pointer;
 }
 
-button:disabled {
-    cursor: not-allowed;
-    opacity: 0.5;
-}
-
 .short {
     border: 1px solid #ddd;
-    padding: 15px;
+    padding: 18px;
     margin: 15px 0;
-    border-radius: 8px;
+    border-radius: 10px;
 }
 
 .ready {
@@ -693,35 +805,32 @@ button:disabled {
     background: #ffebee;
 }
 
-.scene {
-    margin: 8px 0;
+.script {
+    white-space: pre-wrap;
+    line-height: 1.5;
+    margin: 15px 0;
 }
 
-.script {
-    margin: 12px 0;
-    padding: 10px;
-    background: rgba(255,255,255,0.6);
-    border-radius: 6px;
+.meta {
+    font-size: 12px;
+    color: #666;
+    word-break: break-all;
+}
+
+.status {
+    font-weight: bold;
 }
 
 .edit-box {
     display: none;
     margin-top: 15px;
+    padding-top: 15px;
+    border-top: 1px solid #ddd;
 }
 
-.edit-box input,
-.edit-box textarea {
-    width: 100%;
-    margin-bottom: 10px;
-}
-
-.status-badge {
+.message {
+    margin-left: 10px;
     font-weight: bold;
-}
-
-.avatar {
-    font-size: 12px;
-    color: #666;
 }
 
 </style>
@@ -730,23 +839,22 @@ button:disabled {
 <body>
 
 <h1>HeyGen Shorts Generator</h1>
-<p>Очередь Shorts для HeyGen</p>
+
+<p class="subtitle">
+1 Shorts = 1 script + 1 Nik Look
+</p>
+
 
 <div class="topbar">
 
     <div id="stats">
-        Загрузка статистики...
+        Загрузка...
     </div>
 
     <br>
 
     <button onclick="approveAll()">
-        Approve all
-    </button>
-
-    <button disabled
-        title="Генерация будет запускаться через ChatGPT + HeyGen MCP">
-        Generate approved 🔒
+        Approve all ready
     </button>
 
 </div>
@@ -754,16 +862,17 @@ button:disabled {
 
 <h2>Добавить Shorts</h2>
 
-<p>Пока используется старый JSON-формат. На следующем этапе заменим его на один script.</p>
+<p>
+Пока вставляем пакет topic + script.
+Позже ChatGPT будет отправлять его сюда автоматически через MCP.
+</p>
 
 <textarea id="input">
 {
   "shorts": [
     {
-      "topic": "Тема ролика",
-      "scene_1": "Первая часть",
-      "scene_2": "Вторая часть",
-      "scene_3": "Третья часть"
+      "topic": "Почему хорошие связки перестают работать",
+      "script": "Даже прибыльная связка не работает вечно. Это пример полного сценария одного Shorts."
     }
   ]
 }
@@ -775,7 +884,11 @@ button:disabled {
     Добавить в очередь
 </button>
 
-<span id="message"></span>
+<span
+    id="message"
+    class="message"
+></span>
+
 
 <hr>
 
@@ -789,6 +902,16 @@ button:disabled {
 
 
 <script>
+
+function escapeHtml(text) {
+
+    return String(text ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;");
+}
+
 
 async function sendBatch() {
 
@@ -826,7 +949,7 @@ async function sendBatch() {
         message.textContent =
             "Добавлено: " + answer.count;
 
-        loadAll();
+        await loadAll();
 
     } catch (error) {
 
@@ -878,11 +1001,73 @@ async function loadQueue() {
         let video = "";
 
         if (short.video_url) {
+            video = `
+                <p>
+                    <a
+                        href="${short.video_url}"
+                        target="_blank"
+                    >
+                        Открыть видео
+                    </a>
+                </p>
+            `;
+        }
 
-            video =
-                '<p><a href="' +
-                short.video_url +
-                '" target="_blank">Открыть видео</a></p>';
+        let error = "";
+
+        if (short.last_error) {
+            error = `
+                <p>
+                    <strong>Ошибка:</strong>
+                    ${escapeHtml(short.last_error)}
+                </p>
+            `;
+        }
+
+        let approveButton = "";
+
+        if (
+            short.status === "ready" ||
+            short.status === "failed"
+        ) {
+            approveButton = `
+                <button
+                    onclick="approveShort(${short.id})"
+                >
+                    Approve
+                </button>
+            `;
+        }
+
+        let editButton = "";
+
+        if (
+            short.status === "ready" ||
+            short.status === "approved" ||
+            short.status === "failed"
+        ) {
+            editButton = `
+                <button
+                    onclick="showEdit(${short.id})"
+                >
+                    Edit
+                </button>
+            `;
+        }
+
+        let deleteButton = "";
+
+        if (
+            short.status !== "generating" &&
+            short.status !== "completed"
+        ) {
+            deleteButton = `
+                <button
+                    onclick="deleteShort(${short.id})"
+                >
+                    Delete
+                </button>
+            `;
         }
 
         item.innerHTML = `
@@ -892,78 +1077,52 @@ async function loadQueue() {
                 ${escapeHtml(short.topic)}
             </h3>
 
-            <p>
-                <span class="status-badge">
-                    Статус: ${short.status}
-                </span>
+            <p class="status">
+                Статус: ${escapeHtml(short.status)}
             </p>
-
-            <p class="avatar">
-                Avatar:
-                ${short.avatar_id || "—"}
-            </p>
-
-            <div class="scene">
-                <strong>Scene 1:</strong>
-                ${escapeHtml(short.scene_1)}
-            </div>
-
-            <div class="scene">
-                <strong>Scene 2:</strong>
-                ${escapeHtml(short.scene_2)}
-            </div>
-
-            <div class="scene">
-                <strong>Scene 3:</strong>
-                ${escapeHtml(short.scene_3)}
-            </div>
 
             <div class="script">
-                <strong>Future full script:</strong><br>
                 ${escapeHtml(short.script || "")}
             </div>
 
+            <div class="meta">
+                Avatar ID:
+                ${escapeHtml(short.avatar_id || "—")}
+                <br>
+                Voice ID:
+                ${escapeHtml(short.voice_id || "—")}
+            </div>
+
             ${video}
+            ${error}
 
-            <button onclick="showEdit(${short.id})">
-                Edit
-            </button>
+            <br>
 
-            ${
-                short.status === "ready"
-                ?
-                `<button onclick="approveShort(${short.id})">
-                    Approve
-                </button>`
-                :
-                ""
-            }
-
-            <button onclick="deleteShort(${short.id})">
-                Delete
-            </button>
+            ${editButton}
+            ${approveButton}
+            ${deleteButton}
 
             <div
                 class="edit-box"
                 id="edit-${short.id}"
             >
 
+                <label>
+                    Тема
+                </label>
+
                 <input
                     id="topic-${short.id}"
                     value="${escapeHtml(short.topic)}"
                 >
 
-                <textarea
-                    id="scene1-${short.id}"
-                >${escapeHtml(short.scene_1)}</textarea>
+                <label>
+                    Полный script
+                </label>
 
                 <textarea
-                    id="scene2-${short.id}"
-                >${escapeHtml(short.scene_2)}</textarea>
-
-                <textarea
-                    id="scene3-${short.id}"
-                >${escapeHtml(short.scene_3)}</textarea>
+                    id="script-${short.id}"
+                >${escapeHtml(short.script || "")}</textarea>
 
                 <button
                     onclick="saveEdit(${short.id})"
@@ -982,16 +1141,6 @@ async function loadQueue() {
 
         container.appendChild(item);
     });
-}
-
-
-function escapeHtml(text) {
-
-    return String(text ?? "")
-        .replaceAll("&", "&amp;")
-        .replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;")
-        .replaceAll('"', "&quot;");
 }
 
 
@@ -1020,19 +1169,9 @@ async function saveEdit(id) {
                 "topic-" + id
             ).value,
 
-        scene_1:
+        script:
             document.getElementById(
-                "scene1-" + id
-            ).value,
-
-        scene_2:
-            document.getElementById(
-                "scene2-" + id
-            ).value,
-
-        scene_3:
-            document.getElementById(
-                "scene3-" + id
+                "script-" + id
             ).value
     };
 
@@ -1048,10 +1187,10 @@ async function saveEdit(id) {
         }
     );
 
-    if (!response.ok) {
+    const answer =
+        await response.json();
 
-        const answer =
-            await response.json();
+    if (!response.ok) {
 
         alert(
             answer.detail ||
@@ -1061,7 +1200,7 @@ async function saveEdit(id) {
         return;
     }
 
-    loadAll();
+    await loadAll();
 }
 
 
@@ -1074,10 +1213,10 @@ async function approveShort(id) {
         }
     );
 
-    if (!response.ok) {
+    const answer =
+        await response.json();
 
-        const answer =
-            await response.json();
+    if (!response.ok) {
 
         alert(
             answer.detail ||
@@ -1087,7 +1226,7 @@ async function approveShort(id) {
         return;
     }
 
-    loadAll();
+    await loadAll();
 }
 
 
@@ -1120,11 +1259,11 @@ async function approveAll() {
     }
 
     alert(
-        "Одобрено Shorts: " +
+        "Одобрено: " +
         answer.count
     );
 
-    loadAll();
+    await loadAll();
 }
 
 
@@ -1143,10 +1282,10 @@ async function deleteShort(id) {
         }
     );
 
-    if (!response.ok) {
+    const answer =
+        await response.json();
 
-        const answer =
-            await response.json();
+    if (!response.ok) {
 
         alert(
             answer.detail ||
@@ -1156,7 +1295,7 @@ async function deleteShort(id) {
         return;
     }
 
-    loadAll();
+    await loadAll();
 }
 
 
