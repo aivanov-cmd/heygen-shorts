@@ -66,7 +66,42 @@ def init_db():
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+ cur.execute("""
+        ALTER TABLE shorts
+        ADD COLUMN IF NOT EXISTS script TEXT
+    """)
 
+    cur.execute("""
+        ALTER TABLE shorts
+        ADD COLUMN IF NOT EXISTS avatar_id TEXT
+    """)
+
+    cur.execute("""
+        ALTER TABLE shorts
+        ADD COLUMN IF NOT EXISTS subtitle_url TEXT
+    """)
+
+    cur.execute("""
+        ALTER TABLE shorts
+        ADD COLUMN IF NOT EXISTS last_error TEXT
+    """)
+
+    # Для старых записей создаём цельный script из трёх сцен.
+    cur.execute("""
+        UPDATE shorts
+        SET script = CONCAT_WS(' ', scene_1, scene_2, scene_3)
+        WHERE script IS NULL
+    """)
+
+    # Старым записям назначаем первый Look.
+    cur.execute(
+        """
+        UPDATE shorts
+        SET avatar_id = %s
+        WHERE avatar_id IS NULL
+        """,
+        (AVATAR_1,)
+    )
     conn.commit()
     cur.close()
     conn.close()
