@@ -2,4 +2,4 @@ fastapi
 uvicorn
 pydantic
 psycopg2-binary
-mcp
+mcp<2
