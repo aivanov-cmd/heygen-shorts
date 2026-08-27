@@ -915,7 +915,82 @@ def fail_generation(
         "status": "failed",
         "error": clean_text(request.error)
     }
+# ============================================================
+# DRY RUN — PREPARE HEYGEN JOB
+# ============================================================
 
+@app.get("/dry-run/next")
+def dry_run_next():
+    """
+    Берёт первое approved-задание и показывает,
+    что именно будет отправлено в HeyGen.
+
+    ВАЖНО:
+    - статус НЕ меняется
+    - HeyGen НЕ вызывается
+    - кредиты НЕ расходуются
+    """
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            id,
+            topic,
+            script,
+            avatar_id,
+            voice_id
+        FROM shorts
+        WHERE status = 'approved'
+          AND heygen_video_id IS NULL
+        ORDER BY id ASC
+        LIMIT 1
+    """)
+
+    row = cur.fetchone()
+
+    cur.close()
+    conn.close()
+
+    if not row:
+        return {
+            "status": "empty",
+            "message": "No approved Shorts available"
+        }
+
+    short_id = row[0]
+    topic = row[1]
+    script = row[2]
+    avatar_id = row[3]
+    voice_id = row[4]
+
+    return {
+        "status": "dry_run",
+        "heygen_called": False,
+        "credits_used": False,
+
+        "short": {
+            "id": short_id,
+            "topic": topic
+        },
+
+        "heygen_payload": {
+            "title": f"Short #{short_id} - {topic}",
+            "avatarId": avatar_id,
+            "voiceId": voice_id,
+            "script": script,
+            "aspectRatio": "9:16",
+            "resolution": "1080p",
+            "outputFormat": "mp4",
+
+            "caption": {
+                "enabled": True,
+                "file_format": "srt",
+                "burn_into_video": True
+            }
+        }
+    }
 
 # ============================================================
 # PANEL
