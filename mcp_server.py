@@ -2,6 +2,7 @@ import os
 import psycopg2
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -10,10 +11,25 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not configured")
 
 
+RAILWAY_HOST = "diplomatic-vitality-production-e565.up.railway.app"
+
+transport_security = TransportSecuritySettings(
+    enable_dns_rebinding_protection=True,
+    allowed_hosts=[
+        RAILWAY_HOST,
+        f"{RAILWAY_HOST}:*",
+    ],
+    allowed_origins=[
+        f"https://{RAILWAY_HOST}",
+        f"https://{RAILWAY_HOST}:*",
+    ],
+)
+
+
 mcp = FastMCP(
     "HeyGen Shorts Queue",
     stateless_http=True,
-    json_response=True
+    json_response=True,
 )
 
 
@@ -27,7 +43,6 @@ def get_approved_shorts(limit: int = 30) -> dict:
     Get approved Shorts waiting for HeyGen generation.
     Read-only.
     """
-
     limit = max(1, min(limit, 30))
 
     conn = get_db()
@@ -48,7 +63,7 @@ def get_approved_shorts(limit: int = 30) -> dict:
         ORDER BY id ASC
         LIMIT %s
         """,
-        (limit,)
+        (limit,),
     )
 
     rows = cur.fetchall()
@@ -59,18 +74,20 @@ def get_approved_shorts(limit: int = 30) -> dict:
     shorts = []
 
     for row in rows:
-        shorts.append({
-            "id": row[0],
-            "topic": row[1],
-            "script": row[2],
-            "avatar_id": row[3],
-            "voice_id": row[4],
-            "status": row[5]
-        })
+        shorts.append(
+            {
+                "id": row[0],
+                "topic": row[1],
+                "script": row[2],
+                "avatar_id": row[3],
+                "voice_id": row[4],
+                "status": row[5],
+            }
+        )
 
     return {
         "count": len(shorts),
-        "shorts": shorts
+        "shorts": shorts,
     }
 
 
@@ -80,7 +97,6 @@ def get_short(short_id: int) -> dict:
     Get one Short by ID.
     Read-only.
     """
-
     conn = get_db()
     cur = conn.cursor()
 
@@ -100,7 +116,7 @@ def get_short(short_id: int) -> dict:
         FROM shorts
         WHERE id = %s
         """,
-        (short_id,)
+        (short_id,),
     )
 
     row = cur.fetchone()
@@ -111,7 +127,7 @@ def get_short(short_id: int) -> dict:
     if not row:
         return {
             "found": False,
-            "error": "Short not found"
+            "error": "Short not found",
         }
 
     return {
@@ -126,8 +142,8 @@ def get_short(short_id: int) -> dict:
             "heygen_video_id": row[6],
             "video_url": row[7],
             "subtitle_url": row[8],
-            "last_error": row[9]
-        }
+            "last_error": row[9],
+        },
     }
 
 
@@ -137,15 +153,16 @@ def get_queue_stats() -> dict:
     Get queue statistics.
     Read-only.
     """
-
     conn = get_db()
     cur = conn.cursor()
 
-    cur.execute("""
+    cur.execute(
+        """
         SELECT status, COUNT(*)
         FROM shorts
         GROUP BY status
-    """)
+        """
+    )
 
     rows = cur.fetchall()
 
@@ -157,7 +174,7 @@ def get_queue_stats() -> dict:
         "approved": 0,
         "generating": 0,
         "completed": 0,
-        "failed": 0
+        "failed": 0,
     }
 
     total = 0
@@ -168,15 +185,19 @@ def get_queue_stats() -> dict:
 
     return {
         "total": total,
-        **stats
+        **stats,
     }
 
 
 if __name__ == "__main__":
     import uvicorn
 
+    app = mcp.streamable_http_app(
+        transport_security=transport_security
+    )
+
     uvicorn.run(
-        mcp.streamable_http_app(),
+        app,
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 8000))
+        port=int(os.environ.get("PORT", 8000)),
     )
