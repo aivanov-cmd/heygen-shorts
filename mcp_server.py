@@ -1,4 +1,5 @@
 import os
+
 import psycopg2
 
 from mcp.server.fastmcp import FastMCP
@@ -12,6 +13,7 @@ if not DATABASE_URL:
 
 
 RAILWAY_HOST = "diplomatic-vitality-production-e565.up.railway.app"
+
 
 transport_security = TransportSecuritySettings(
     enable_dns_rebinding_protection=True,
@@ -193,7 +195,7 @@ def get_queue_stats() -> dict:
 if __name__ == "__main__":
     import uvicorn
 
-app = mcp.streamable_http_app()
+    app = mcp.streamable_http_app()
 
     uvicorn.run(
         app,
