@@ -6,14 +6,25 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 
+# ============================================================
+# DATABASE
+# ============================================================
+
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not configured")
 
 
-RAILWAY_HOST = "diplomatic-vitality-production-e565.up.railway.app"
+def get_db():
+    return psycopg2.connect(DATABASE_URL)
 
+
+# ============================================================
+# MCP TRANSPORT SECURITY
+# ============================================================
+
+RAILWAY_HOST = "diplomatic-vitality-production-e565.up.railway.app"
 
 transport_security = TransportSecuritySettings(
     enable_dns_rebinding_protection=True,
@@ -28,6 +39,10 @@ transport_security = TransportSecuritySettings(
 )
 
 
+# ============================================================
+# MCP SERVER
+# ============================================================
+
 mcp = FastMCP(
     "HeyGen Shorts Queue",
     stateless_http=True,
@@ -36,9 +51,9 @@ mcp = FastMCP(
 )
 
 
-def get_db():
-    return psycopg2.connect(DATABASE_URL)
-
+# ============================================================
+# TOOL: GET APPROVED SHORTS
+# ============================================================
 
 @mcp.tool()
 def get_approved_shorts(limit: int = 30) -> dict:
@@ -46,33 +61,36 @@ def get_approved_shorts(limit: int = 30) -> dict:
     Get approved Shorts waiting for HeyGen generation.
     Read-only.
     """
+
     limit = max(1, min(limit, 30))
 
     conn = get_db()
     cur = conn.cursor()
 
-    cur.execute(
-        """
-        SELECT
-            id,
-            topic,
-            script,
-            avatar_id,
-            voice_id,
-            status
-        FROM shorts
-        WHERE status = 'approved'
-          AND heygen_video_id IS NULL
-        ORDER BY id ASC
-        LIMIT %s
-        """,
-        (limit,),
-    )
+    try:
+        cur.execute(
+            """
+            SELECT
+                id,
+                topic,
+                script,
+                avatar_id,
+                voice_id,
+                status
+            FROM shorts
+            WHERE status = 'approved'
+              AND heygen_video_id IS NULL
+            ORDER BY id ASC
+            LIMIT %s
+            """,
+            (limit,),
+        )
 
-    rows = cur.fetchall()
+        rows = cur.fetchall()
 
-    cur.close()
-    conn.close()
+    finally:
+        cur.close()
+        conn.close()
 
     shorts = []
 
@@ -94,38 +112,45 @@ def get_approved_shorts(limit: int = 30) -> dict:
     }
 
 
+# ============================================================
+# TOOL: GET ONE SHORT
+# ============================================================
+
 @mcp.tool()
 def get_short(short_id: int) -> dict:
     """
     Get one Short by ID.
     Read-only.
     """
+
     conn = get_db()
     cur = conn.cursor()
 
-    cur.execute(
-        """
-        SELECT
-            id,
-            topic,
-            script,
-            avatar_id,
-            voice_id,
-            status,
-            heygen_video_id,
-            video_url,
-            subtitle_url,
-            last_error
-        FROM shorts
-        WHERE id = %s
-        """,
-        (short_id,),
-    )
+    try:
+        cur.execute(
+            """
+            SELECT
+                id,
+                topic,
+                script,
+                avatar_id,
+                voice_id,
+                status,
+                heygen_video_id,
+                video_url,
+                subtitle_url,
+                last_error
+            FROM shorts
+            WHERE id = %s
+            """,
+            (short_id,),
+        )
 
-    row = cur.fetchone()
+        row = cur.fetchone()
 
-    cur.close()
-    conn.close()
+    finally:
+        cur.close()
+        conn.close()
 
     if not row:
         return {
@@ -150,27 +175,34 @@ def get_short(short_id: int) -> dict:
     }
 
 
+# ============================================================
+# TOOL: GET QUEUE STATS
+# ============================================================
+
 @mcp.tool()
 def get_queue_stats() -> dict:
     """
     Get queue statistics.
     Read-only.
     """
+
     conn = get_db()
     cur = conn.cursor()
 
-    cur.execute(
-        """
-        SELECT status, COUNT(*)
-        FROM shorts
-        GROUP BY status
-        """
-    )
+    try:
+        cur.execute(
+            """
+            SELECT status, COUNT(*)
+            FROM shorts
+            GROUP BY status
+            """
+        )
 
-    rows = cur.fetchall()
+        rows = cur.fetchall()
 
-    cur.close()
-    conn.close()
+    finally:
+        cur.close()
+        conn.close()
 
     stats = {
         "ready": 0,
@@ -192,8 +224,22 @@ def get_queue_stats() -> dict:
     }
 
 
+# ============================================================
+# START SERVER
+# ============================================================
+
 if __name__ == "__main__":
     import uvicorn
+
+    # Diagnostic output.
+    # This only prints the tools registered in MCP.
+    # It does NOT call the tools and does NOT access HeyGen.
+    registered_tools = mcp._tool_manager.list_tools()
+
+    print("REGISTERED MCP TOOLS:", flush=True)
+
+    for tool in registered_tools:
+        print(f"- {tool.name}", flush=True)
 
     app = mcp.streamable_http_app()
 
