@@ -41,6 +41,10 @@ mcp = FastMCP(
 )
 
 
+# =========================================================
+# READ-ONLY TOOLS
+# =========================================================
+
 @mcp.tool()
 def get_approved_shorts(limit: int = 30) -> dict:
     """Get approved Shorts waiting for HeyGen generation. Read-only."""
@@ -169,6 +173,209 @@ def get_queue_stats() -> dict:
     }
 
 
+# =========================================================
+# WRITE TOOLS
+# =========================================================
+
+@mcp.tool()
+def mark_generating(short_id: int) -> dict:
+    """
+    Mark an approved Short as generating.
+    Only approved -> generating is allowed.
+    """
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            """
+            UPDATE shorts
+            SET status = 'generating',
+                last_error = NULL,
+                updated_at = NOW()
+            WHERE id = %s
+              AND status = 'approved'
+              AND heygen_video_id IS NULL
+            RETURNING id, status
+            """,
+            (short_id,),
+        )
+
+        row = cur.fetchone()
+
+        if not row:
+            conn.rollback()
+            return {
+                "success": False,
+                "error": "Short not found or is not eligible for approved -> generating transition",
+                "short_id": short_id,
+            }
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "short_id": row[0],
+            "status": row[1],
+        }
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+@mcp.tool()
+def mark_completed(
+    short_id: int,
+    heygen_video_id: str,
+    video_url: str,
+    subtitle_url: str | None = None,
+) -> dict:
+    """
+    Mark a generating Short as completed and save HeyGen result.
+    Only generating -> completed is allowed.
+    """
+
+    if not heygen_video_id.strip():
+        return {
+            "success": False,
+            "error": "heygen_video_id cannot be empty",
+            "short_id": short_id,
+        }
+
+    if not video_url.strip():
+        return {
+            "success": False,
+            "error": "video_url cannot be empty",
+            "short_id": short_id,
+        }
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            """
+            UPDATE shorts
+            SET status = 'completed',
+                heygen_video_id = %s,
+                video_url = %s,
+                subtitle_url = %s,
+                last_error = NULL,
+                updated_at = NOW()
+            WHERE id = %s
+              AND status = 'generating'
+            RETURNING id, status, heygen_video_id, video_url, subtitle_url
+            """,
+            (
+                heygen_video_id,
+                video_url,
+                subtitle_url,
+                short_id,
+            ),
+        )
+
+        row = cur.fetchone()
+
+        if not row:
+            conn.rollback()
+            return {
+                "success": False,
+                "error": "Short not found or is not eligible for generating -> completed transition",
+                "short_id": short_id,
+            }
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "short_id": row[0],
+            "status": row[1],
+            "heygen_video_id": row[2],
+            "video_url": row[3],
+            "subtitle_url": row[4],
+        }
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+@mcp.tool()
+def mark_failed(short_id: int, error_message: str) -> dict:
+    """
+    Mark a generating Short as failed and save the error.
+    Only generating -> failed is allowed.
+    """
+
+    if not error_message.strip():
+        return {
+            "success": False,
+            "error": "error_message cannot be empty",
+            "short_id": short_id,
+        }
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            """
+            UPDATE shorts
+            SET status = 'failed',
+                last_error = %s,
+                updated_at = NOW()
+            WHERE id = %s
+              AND status = 'generating'
+            RETURNING id, status, last_error
+            """,
+            (
+                error_message[:2000],
+                short_id,
+            ),
+        )
+
+        row = cur.fetchone()
+
+        if not row:
+            conn.rollback()
+            return {
+                "success": False,
+                "error": "Short not found or is not eligible for generating -> failed transition",
+                "short_id": short_id,
+            }
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "short_id": row[0],
+            "status": row[1],
+            "last_error": row[2],
+        }
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+# =========================================================
+# API KEY PROTECTION
+# =========================================================
+
 class APIKeyMiddleware:
     def __init__(self, app):
         self.app = app
@@ -217,7 +424,6 @@ if __name__ == "__main__":
         print(f"- {tool.name}", flush=True)
 
     mcp_app = mcp.streamable_http_app()
-
     app = APIKeyMiddleware(mcp_app)
 
     uvicorn.run(
