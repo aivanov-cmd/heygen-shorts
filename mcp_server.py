@@ -1,28 +1,23 @@
 import os
-
+import hmac
 import psycopg2
-
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 
-# ============================================================
-# DATABASE
-# ============================================================
-
 DATABASE_URL = os.environ.get("DATABASE_URL")
+MCP_API_KEY = os.environ.get("MCP_API_KEY")
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not configured")
+
+if not MCP_API_KEY:
+    raise RuntimeError("MCP_API_KEY is not configured")
 
 
 def get_db():
     return psycopg2.connect(DATABASE_URL)
 
-
-# ============================================================
-# MCP TRANSPORT SECURITY
-# ============================================================
 
 RAILWAY_HOST = "diplomatic-vitality-production-e565.up.railway.app"
 
@@ -38,11 +33,6 @@ transport_security = TransportSecuritySettings(
     ],
 )
 
-
-# ============================================================
-# MCP SERVER
-# ============================================================
-
 mcp = FastMCP(
     "HeyGen Shorts Queue",
     stateless_http=True,
@@ -51,17 +41,9 @@ mcp = FastMCP(
 )
 
 
-# ============================================================
-# TOOL: GET APPROVED SHORTS
-# ============================================================
-
 @mcp.tool()
 def get_approved_shorts(limit: int = 30) -> dict:
-    """
-    Get approved Shorts waiting for HeyGen generation.
-    Read-only.
-    """
-
+    """Get approved Shorts waiting for HeyGen generation. Read-only."""
     limit = max(1, min(limit, 30))
 
     conn = get_db()
@@ -70,13 +52,7 @@ def get_approved_shorts(limit: int = 30) -> dict:
     try:
         cur.execute(
             """
-            SELECT
-                id,
-                topic,
-                script,
-                avatar_id,
-                voice_id,
-                status
+            SELECT id, topic, script, avatar_id, voice_id, status
             FROM shorts
             WHERE status = 'approved'
               AND heygen_video_id IS NULL
@@ -85,9 +61,7 @@ def get_approved_shorts(limit: int = 30) -> dict:
             """,
             (limit,),
         )
-
         rows = cur.fetchall()
-
     finally:
         cur.close()
         conn.close()
@@ -95,16 +69,14 @@ def get_approved_shorts(limit: int = 30) -> dict:
     shorts = []
 
     for row in rows:
-        shorts.append(
-            {
-                "id": row[0],
-                "topic": row[1],
-                "script": row[2],
-                "avatar_id": row[3],
-                "voice_id": row[4],
-                "status": row[5],
-            }
-        )
+        shorts.append({
+            "id": row[0],
+            "topic": row[1],
+            "script": row[2],
+            "avatar_id": row[3],
+            "voice_id": row[4],
+            "status": row[5],
+        })
 
     return {
         "count": len(shorts),
@@ -112,16 +84,9 @@ def get_approved_shorts(limit: int = 30) -> dict:
     }
 
 
-# ============================================================
-# TOOL: GET ONE SHORT
-# ============================================================
-
 @mcp.tool()
 def get_short(short_id: int) -> dict:
-    """
-    Get one Short by ID.
-    Read-only.
-    """
+    """Get one Short by ID. Read-only."""
 
     conn = get_db()
     cur = conn.cursor()
@@ -129,25 +94,14 @@ def get_short(short_id: int) -> dict:
     try:
         cur.execute(
             """
-            SELECT
-                id,
-                topic,
-                script,
-                avatar_id,
-                voice_id,
-                status,
-                heygen_video_id,
-                video_url,
-                subtitle_url,
-                last_error
+            SELECT id, topic, script, avatar_id, voice_id, status,
+                   heygen_video_id, video_url, subtitle_url, last_error
             FROM shorts
             WHERE id = %s
             """,
             (short_id,),
         )
-
         row = cur.fetchone()
-
     finally:
         cur.close()
         conn.close()
@@ -175,16 +129,9 @@ def get_short(short_id: int) -> dict:
     }
 
 
-# ============================================================
-# TOOL: GET QUEUE STATS
-# ============================================================
-
 @mcp.tool()
 def get_queue_stats() -> dict:
-    """
-    Get queue statistics.
-    Read-only.
-    """
+    """Get queue statistics. Read-only."""
 
     conn = get_db()
     cur = conn.cursor()
@@ -197,9 +144,7 @@ def get_queue_stats() -> dict:
             GROUP BY status
             """
         )
-
         rows = cur.fetchall()
-
     finally:
         cur.close()
         conn.close()
@@ -224,16 +169,46 @@ def get_queue_stats() -> dict:
     }
 
 
-# ============================================================
-# START SERVER
-# ============================================================
+class APIKeyMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = {
+            key.decode("latin-1").lower(): value.decode("latin-1")
+            for key, value in scope.get("headers", [])
+        }
+
+        supplied_key = headers.get("x-mcp-api-key", "")
+
+        if not hmac.compare_digest(supplied_key, MCP_API_KEY):
+            body = b'{"error":"Unauthorized"}'
+
+            await send({
+                "type": "http.response.start",
+                "status": 401,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+            })
+
+            await send({
+                "type": "http.response.body",
+                "body": body,
+            })
+            return
+
+        await self.app(scope, receive, send)
+
 
 if __name__ == "__main__":
     import uvicorn
 
-    # Diagnostic output.
-    # This only prints the tools registered in MCP.
-    # It does NOT call the tools and does NOT access HeyGen.
     registered_tools = mcp._tool_manager.list_tools()
 
     print("REGISTERED MCP TOOLS:", flush=True)
@@ -241,7 +216,9 @@ if __name__ == "__main__":
     for tool in registered_tools:
         print(f"- {tool.name}", flush=True)
 
-    app = mcp.streamable_http_app()
+    mcp_app = mcp.streamable_http_app()
+
+    app = APIKeyMiddleware(mcp_app)
 
     uvicorn.run(
         app,
