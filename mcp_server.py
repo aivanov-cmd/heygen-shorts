@@ -30,6 +30,7 @@ mcp = FastMCP(
     "HeyGen Shorts Queue",
     stateless_http=True,
     json_response=True,
+    transport_security=transport_security,
 )
 
 
@@ -192,9 +193,7 @@ def get_queue_stats() -> dict:
 if __name__ == "__main__":
     import uvicorn
 
-    app = mcp.streamable_http_app(
-        transport_security=transport_security
-    )
+app = mcp.streamable_http_app()
 
     uvicorn.run(
         app,
