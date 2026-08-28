@@ -183,7 +183,7 @@ class APIKeyMiddleware:
             for key, value in scope.get("headers", [])
         }
 
-        supplied_key = headers.get("x-mcp-api-key", "")
+        supplied_key = headers.get("x-api-key", "")
 
         if not hmac.compare_digest(supplied_key, MCP_API_KEY):
             body = b'{"error":"Unauthorized"}'
