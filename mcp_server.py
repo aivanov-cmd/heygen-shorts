@@ -1,15 +1,231 @@
 import os
 import hmac
 import psycopg2
+
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+MCP_API_KEY = os.environ.get("MCP_API_KEY")
+
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not configured")
+
+if not MCP_API_KEY:
+    raise RuntimeError("MCP_API_KEY is not configured")
+
+
+def get_db():
+    return psycopg2.connect(DATABASE_URL)
+
+
+# =========================================================
+# MCP SERVER
+# =========================================================
+
+RAILWAY_HOST = "diplomatic-vitality-production-e565.up.railway.app"
+
+transport_security = TransportSecuritySettings(
+    enable_dns_rebinding_protection=True,
+    allowed_hosts=[
+        RAILWAY_HOST,
+        f"{RAILWAY_HOST}:*",
+    ],
+    allowed_origins=[
+        f"https://{RAILWAY_HOST}",
+        f"https://{RAILWAY_HOST}:*",
+    ],
+)
+
+mcp = FastMCP(
+    "HeyGen Shorts Queue",
+    stateless_http=True,
+    json_response=True,
+    transport_security=transport_security,
+)
+
+
+# =========================================================
+# READ-ONLY TOOLS
+# =========================================================
+
+@mcp.tool()
+def get_approved_shorts(limit: int = 30) -> dict:
+    """
+    Get approved Shorts waiting for HeyGen generation.
+    Read-only.
+    """
+
+    limit = max(1, min(limit, 30))
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            """
+            SELECT id, topic, script, avatar_id, voice_id, status
+            FROM shorts
+            WHERE status = 'approved'
+              AND heygen_video_id IS NULL
+            ORDER BY id ASC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+
+        rows = cur.fetchall()
+
+    finally:
+        cur.close()
+        conn.close()
+
+    shorts = []
+
+    for row in rows:
+        shorts.append({
+            "id": row[0],
+            "topic": row[1],
+            "script": row[2],
+            "avatar_id": row[3],
+            "voice_id": row[4],
+            "status": row[5],
+        })
+
+    return {
+        "count": len(shorts),
+        "shorts": shorts,
+    }
+
+
+@mcp.tool()
+def get_short(short_id: int) -> dict:
+    """
+    Get one Short by ID.
+    Read-only.
+    """
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            """
+            SELECT
+                id,
+                topic,
+                script,
+                avatar_id,
+                voice_id,
+                status,
+                heygen_video_id,
+                video_url,
+                subtitle_url,
+                last_error
+            FROM shorts
+            WHERE id = %s
+            """,
+            (short_id,),
+        )
+
+        row = cur.fetchone()
+
+    finally:
+        cur.close()
+        conn.close()
+
+    if not row:
+        return {
+            "found": False,
+            "error": "Short not found",
+        }
+
+    return {
+        "found": True,
+        "short": {
+            "id": row[0],
+            "topic": row[1],
+            "script": row[2],
+            "avatar_id": row[3],
+            "voice_id": row[4],
+            "status": row[5],
+            "heygen_video_id": row[6],
+            "video_url": row[7],
+            "subtitle_url": row[8],
+            "last_error": row[9],
+        },
+    }
+
+
+@mcp.tool()
+def get_queue_stats() -> dict:
+    """
+    Get queue statistics.
+    Read-only.
+    """
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            """
+            SELECT status, COUNT(*)
+            FROM shorts
+            GROUP BY status
+            """
+        )
+
+        rows = cur.fetchall()
+
+    finally:
+        cur.close()
+        conn.close()
+
+    stats = {
+        "ready": 0,
+        "approved": 0,
+        "generating": 0,
+        "completed": 0,
+        "failed": 0,
+    }
+
+    total = 0
+
+    for status, count in rows:
+        stats[status] = count
+        total += count
+
+    return {
+        "total": total,
+        **stats,
+    }
+
+
+# =========================================================
+# CREATE BATCH
+# =========================================================
 
 @mcp.tool()
 def create_shorts_batch(shorts: list[dict]) -> dict:
     """
-    Create a batch of new approved Shorts in PostgreSQL.
-    Does not call HeyGen.
+    Create new approved Shorts in PostgreSQL.
+
+    Required fields for every Short:
+    - topic
+    - script
+    - avatar_id
+    - voice_id
+
     Maximum 30 Shorts per request.
+
+    This tool only creates database records.
+    It does NOT call HeyGen and does NOT generate videos.
     """
 
     if not shorts:
@@ -27,6 +243,7 @@ def create_shorts_batch(shorts: list[dict]) -> dict:
     validated = []
 
     for index, item in enumerate(shorts, start=1):
+
         topic = str(item.get("topic", "")).strip()
         script = str(item.get("script", "")).strip()
         avatar_id = str(item.get("avatar_id", "")).strip()
@@ -69,7 +286,9 @@ def create_shorts_batch(shorts: list[dict]) -> dict:
     created = []
 
     try:
+
         for item in validated:
+
             cur.execute(
                 """
                 INSERT INTO shorts (
@@ -98,7 +317,12 @@ def create_shorts_batch(shorts: list[dict]) -> dict:
                     NOW(),
                     NOW()
                 )
-                RETURNING id, topic, status, avatar_id, voice_id
+                RETURNING
+                    id,
+                    topic,
+                    status,
+                    avatar_id,
+                    voice_id
                 """,
                 (
                     item["topic"],
@@ -134,193 +358,30 @@ def create_shorts_batch(shorts: list[dict]) -> dict:
         cur.close()
         conn.close()
 
-DATABASE_URL = os.environ.get("DATABASE_URL")
-MCP_API_KEY = os.environ.get("MCP_API_KEY")
-
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not configured")
-
-if not MCP_API_KEY:
-    raise RuntimeError("MCP_API_KEY is not configured")
-
-
-def get_db():
-    return psycopg2.connect(DATABASE_URL)
-
-
-RAILWAY_HOST = "diplomatic-vitality-production-e565.up.railway.app"
-
-transport_security = TransportSecuritySettings(
-    enable_dns_rebinding_protection=True,
-    allowed_hosts=[
-        RAILWAY_HOST,
-        f"{RAILWAY_HOST}:*",
-    ],
-    allowed_origins=[
-        f"https://{RAILWAY_HOST}",
-        f"https://{RAILWAY_HOST}:*",
-    ],
-)
-
-mcp = FastMCP(
-    "HeyGen Shorts Queue",
-    stateless_http=True,
-    json_response=True,
-    transport_security=transport_security,
-)
-
 
 # =========================================================
-# READ-ONLY TOOLS
-# =========================================================
-
-@mcp.tool()
-def get_approved_shorts(limit: int = 30) -> dict:
-    """Get approved Shorts waiting for HeyGen generation. Read-only."""
-    limit = max(1, min(limit, 30))
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    try:
-        cur.execute(
-            """
-            SELECT id, topic, script, avatar_id, voice_id, status
-            FROM shorts
-            WHERE status = 'approved'
-              AND heygen_video_id IS NULL
-            ORDER BY id ASC
-            LIMIT %s
-            """,
-            (limit,),
-        )
-        rows = cur.fetchall()
-    finally:
-        cur.close()
-        conn.close()
-
-    shorts = []
-
-    for row in rows:
-        shorts.append({
-            "id": row[0],
-            "topic": row[1],
-            "script": row[2],
-            "avatar_id": row[3],
-            "voice_id": row[4],
-            "status": row[5],
-        })
-
-    return {
-        "count": len(shorts),
-        "shorts": shorts,
-    }
-
-
-@mcp.tool()
-def get_short(short_id: int) -> dict:
-    """Get one Short by ID. Read-only."""
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    try:
-        cur.execute(
-            """
-            SELECT id, topic, script, avatar_id, voice_id, status,
-                   heygen_video_id, video_url, subtitle_url, last_error
-            FROM shorts
-            WHERE id = %s
-            """,
-            (short_id,),
-        )
-        row = cur.fetchone()
-    finally:
-        cur.close()
-        conn.close()
-
-    if not row:
-        return {
-            "found": False,
-            "error": "Short not found",
-        }
-
-    return {
-        "found": True,
-        "short": {
-            "id": row[0],
-            "topic": row[1],
-            "script": row[2],
-            "avatar_id": row[3],
-            "voice_id": row[4],
-            "status": row[5],
-            "heygen_video_id": row[6],
-            "video_url": row[7],
-            "subtitle_url": row[8],
-            "last_error": row[9],
-        },
-    }
-
-
-@mcp.tool()
-def get_queue_stats() -> dict:
-    """Get queue statistics. Read-only."""
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    try:
-        cur.execute(
-            """
-            SELECT status, COUNT(*)
-            FROM shorts
-            GROUP BY status
-            """
-        )
-        rows = cur.fetchall()
-    finally:
-        cur.close()
-        conn.close()
-
-    stats = {
-        "ready": 0,
-        "approved": 0,
-        "generating": 0,
-        "completed": 0,
-        "failed": 0,
-    }
-
-    total = 0
-
-    for status, count in rows:
-        stats[status] = count
-        total += count
-
-    return {
-        "total": total,
-        **stats,
-    }
-
-
-# =========================================================
-# WRITE TOOLS
+# STATUS WRITE TOOLS
 # =========================================================
 
 @mcp.tool()
 def mark_generating(short_id: int) -> dict:
     """
     Mark an approved Short as generating.
-    Only approved -> generating is allowed.
+
+    Allowed transition:
+    approved -> generating
     """
 
     conn = get_db()
     cur = conn.cursor()
 
     try:
+
         cur.execute(
             """
             UPDATE shorts
-            SET status = 'generating',
+            SET
+                status = 'generating',
                 last_error = NULL,
                 updated_at = NOW()
             WHERE id = %s
@@ -335,9 +396,13 @@ def mark_generating(short_id: int) -> dict:
 
         if not row:
             conn.rollback()
+
             return {
                 "success": False,
-                "error": "Short not found or is not eligible for approved -> generating transition",
+                "error": (
+                    "Short not found or is not eligible for "
+                    "approved -> generating transition"
+                ),
                 "short_id": short_id,
             }
 
@@ -366,18 +431,28 @@ def mark_completed(
     subtitle_url: str | None = None,
 ) -> dict:
     """
-    Mark a generating Short as completed and save HeyGen result.
-    Only generating -> completed is allowed.
+    Mark a generating Short as completed
+    and save the HeyGen result.
+
+    Allowed transition:
+    generating -> completed
+
+    IMPORTANT:
+    For videos requiring burned-in subtitles,
+    pass HeyGen captioned_video_url as video_url.
     """
 
-    if not heygen_video_id.strip():
+    heygen_video_id = heygen_video_id.strip()
+    video_url = video_url.strip()
+
+    if not heygen_video_id:
         return {
             "success": False,
             "error": "heygen_video_id cannot be empty",
             "short_id": short_id,
         }
 
-    if not video_url.strip():
+    if not video_url:
         return {
             "success": False,
             "error": "video_url cannot be empty",
@@ -388,10 +463,12 @@ def mark_completed(
     cur = conn.cursor()
 
     try:
+
         cur.execute(
             """
             UPDATE shorts
-            SET status = 'completed',
+            SET
+                status = 'completed',
                 heygen_video_id = %s,
                 video_url = %s,
                 subtitle_url = %s,
@@ -399,7 +476,12 @@ def mark_completed(
                 updated_at = NOW()
             WHERE id = %s
               AND status = 'generating'
-            RETURNING id, status, heygen_video_id, video_url, subtitle_url
+            RETURNING
+                id,
+                status,
+                heygen_video_id,
+                video_url,
+                subtitle_url
             """,
             (
                 heygen_video_id,
@@ -413,9 +495,13 @@ def mark_completed(
 
         if not row:
             conn.rollback()
+
             return {
                 "success": False,
-                "error": "Short not found or is not eligible for generating -> completed transition",
+                "error": (
+                    "Short not found or is not eligible for "
+                    "generating -> completed transition"
+                ),
                 "short_id": short_id,
             }
 
@@ -440,13 +526,21 @@ def mark_completed(
 
 
 @mcp.tool()
-def mark_failed(short_id: int, error_message: str) -> dict:
+def mark_failed(
+    short_id: int,
+    error_message: str,
+) -> dict:
     """
-    Mark a generating Short as failed and save the error.
-    Only generating -> failed is allowed.
+    Mark a generating Short as failed
+    and save the error.
+
+    Allowed transition:
+    generating -> failed
     """
 
-    if not error_message.strip():
+    error_message = error_message.strip()
+
+    if not error_message:
         return {
             "success": False,
             "error": "error_message cannot be empty",
@@ -457,15 +551,20 @@ def mark_failed(short_id: int, error_message: str) -> dict:
     cur = conn.cursor()
 
     try:
+
         cur.execute(
             """
             UPDATE shorts
-            SET status = 'failed',
+            SET
+                status = 'failed',
                 last_error = %s,
                 updated_at = NOW()
             WHERE id = %s
               AND status = 'generating'
-            RETURNING id, status, last_error
+            RETURNING
+                id,
+                status,
+                last_error
             """,
             (
                 error_message[:2000],
@@ -477,9 +576,13 @@ def mark_failed(short_id: int, error_message: str) -> dict:
 
         if not row:
             conn.rollback()
+
             return {
                 "success": False,
-                "error": "Short not found or is not eligible for generating -> failed transition",
+                "error": (
+                    "Short not found or is not eligible for "
+                    "generating -> failed transition"
+                ),
                 "short_id": short_id,
             }
 
@@ -506,10 +609,12 @@ def mark_failed(short_id: int, error_message: str) -> dict:
 # =========================================================
 
 class APIKeyMiddleware:
+
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
+
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
@@ -521,15 +626,25 @@ class APIKeyMiddleware:
 
         supplied_key = headers.get("x-api-key", "")
 
-        if not hmac.compare_digest(supplied_key, MCP_API_KEY):
+        if not hmac.compare_digest(
+            supplied_key,
+            MCP_API_KEY,
+        ):
+
             body = b'{"error":"Unauthorized"}'
 
             await send({
                 "type": "http.response.start",
                 "status": 401,
                 "headers": [
-                    (b"content-type", b"application/json"),
-                    (b"content-length", str(len(body)).encode()),
+                    (
+                        b"content-type",
+                        b"application/json",
+                    ),
+                    (
+                        b"content-length",
+                        str(len(body)).encode(),
+                    ),
                 ],
             })
 
@@ -537,26 +652,50 @@ class APIKeyMiddleware:
                 "type": "http.response.body",
                 "body": body,
             })
+
             return
 
-        await self.app(scope, receive, send)
+        await self.app(
+            scope,
+            receive,
+            send,
+        )
 
+
+# =========================================================
+# START SERVER
+# =========================================================
 
 if __name__ == "__main__":
+
     import uvicorn
 
     registered_tools = mcp._tool_manager.list_tools()
 
-    print("REGISTERED MCP TOOLS:", flush=True)
+    print(
+        "REGISTERED MCP TOOLS:",
+        flush=True,
+    )
 
     for tool in registered_tools:
-        print(f"- {tool.name}", flush=True)
+        print(
+            f"- {tool.name}",
+            flush=True,
+        )
 
     mcp_app = mcp.streamable_http_app()
-    app = APIKeyMiddleware(mcp_app)
+
+    app = APIKeyMiddleware(
+        mcp_app,
+    )
 
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 8000)),
+        port=int(
+            os.environ.get(
+                "PORT",
+                8000,
+            )
+        ),
     )
