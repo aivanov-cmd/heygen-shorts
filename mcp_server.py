@@ -4,6 +4,135 @@ import psycopg2
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
+@mcp.tool()
+def create_shorts_batch(shorts: list[dict]) -> dict:
+    """
+    Create a batch of new approved Shorts in PostgreSQL.
+    Does not call HeyGen.
+    Maximum 30 Shorts per request.
+    """
+
+    if not shorts:
+        return {
+            "success": False,
+            "error": "shorts list cannot be empty",
+        }
+
+    if len(shorts) > 30:
+        return {
+            "success": False,
+            "error": "Maximum 30 Shorts per batch",
+        }
+
+    validated = []
+
+    for index, item in enumerate(shorts, start=1):
+        topic = str(item.get("topic", "")).strip()
+        script = str(item.get("script", "")).strip()
+        avatar_id = str(item.get("avatar_id", "")).strip()
+        voice_id = str(item.get("voice_id", "")).strip()
+
+        if not topic:
+            return {
+                "success": False,
+                "error": f"Short #{index}: topic is required",
+            }
+
+        if not script:
+            return {
+                "success": False,
+                "error": f"Short #{index}: script is required",
+            }
+
+        if not avatar_id:
+            return {
+                "success": False,
+                "error": f"Short #{index}: avatar_id is required",
+            }
+
+        if not voice_id:
+            return {
+                "success": False,
+                "error": f"Short #{index}: voice_id is required",
+            }
+
+        validated.append({
+            "topic": topic,
+            "script": script,
+            "avatar_id": avatar_id,
+            "voice_id": voice_id,
+        })
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    created = []
+
+    try:
+        for item in validated:
+            cur.execute(
+                """
+                INSERT INTO shorts (
+                    topic,
+                    script,
+                    avatar_id,
+                    voice_id,
+                    status,
+                    heygen_video_id,
+                    video_url,
+                    subtitle_url,
+                    last_error,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    'approved',
+                    NULL,
+                    NULL,
+                    NULL,
+                    NULL,
+                    NOW(),
+                    NOW()
+                )
+                RETURNING id, topic, status, avatar_id, voice_id
+                """,
+                (
+                    item["topic"],
+                    item["script"],
+                    item["avatar_id"],
+                    item["voice_id"],
+                ),
+            )
+
+            row = cur.fetchone()
+
+            created.append({
+                "id": row[0],
+                "topic": row[1],
+                "status": row[2],
+                "avatar_id": row[3],
+                "voice_id": row[4],
+            })
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "count": len(created),
+            "shorts": created,
+        }
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        cur.close()
+        conn.close()
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 MCP_API_KEY = os.environ.get("MCP_API_KEY")
