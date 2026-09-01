@@ -711,7 +711,8 @@ def download_completed_video(short_id: int) -> dict:
         "file_path": str(file_path),
         "size_bytes": file_size,
         "size_mb": round(file_size / 1024 / 1024, 2),
-        "temporary": True,
+        "temporary": False,
+"persistent_storage": True,
     }
 # =========================================================
 # API KEY PROTECTION
