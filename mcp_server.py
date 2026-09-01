@@ -603,7 +603,116 @@ def mark_failed(
         cur.close()
         conn.close()
 
+# =========================================================
+# VIDEO DOWNLOAD
+# =========================================================
 
+@mcp.tool()
+def download_completed_video(short_id: int) -> dict:
+    """
+    Download the completed captioned MP4 stored in video_url.
+
+    Read-only for PostgreSQL.
+    Does NOT call HeyGen generation.
+    Does NOT change Short status.
+    """
+
+    import urllib.request
+    from pathlib import Path
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            """
+            SELECT id, status, video_url
+            FROM shorts
+            WHERE id = %s
+            """,
+            (short_id,),
+        )
+
+        row = cur.fetchone()
+
+    finally:
+        cur.close()
+        conn.close()
+
+    if not row:
+        return {
+            "success": False,
+            "error": "Short not found",
+            "short_id": short_id,
+        }
+
+    short_id_db, status, video_url = row
+
+    if status != "completed":
+        return {
+            "success": False,
+            "error": "Short is not completed",
+            "short_id": short_id,
+            "status": status,
+        }
+
+    if not video_url:
+        return {
+            "success": False,
+            "error": "video_url is empty",
+            "short_id": short_id,
+        }
+
+    download_dir = Path("/tmp/heygen_shorts")
+    download_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    file_path = download_dir / f"short_{short_id_db}.mp4"
+
+    try:
+        request = urllib.request.Request(
+            video_url,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+            },
+        )
+
+        with urllib.request.urlopen(
+            request,
+            timeout=120,
+        ) as response:
+            with open(file_path, "wb") as output:
+                while True:
+                    chunk = response.read(1024 * 1024)
+
+                    if not chunk:
+                        break
+
+                    output.write(chunk)
+
+    except Exception as exc:
+        if file_path.exists():
+            file_path.unlink()
+
+        return {
+            "success": False,
+            "error": f"Download failed: {exc}",
+            "short_id": short_id,
+        }
+
+    file_size = file_path.stat().st_size
+
+    return {
+        "success": True,
+        "short_id": short_id,
+        "file_name": file_path.name,
+        "file_path": str(file_path),
+        "size_bytes": file_size,
+        "size_mb": round(file_size / 1024 / 1024, 2),
+        "temporary": True,
+    }
 # =========================================================
 # API KEY PROTECTION
 # =========================================================
