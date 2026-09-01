@@ -663,7 +663,7 @@ def download_completed_video(short_id: int) -> dict:
             "short_id": short_id,
         }
 
-    download_dir = Path("/tmp/heygen_shorts")
+    download_dir = Path("/videos")
     download_dir.mkdir(
         parents=True,
         exist_ok=True,
