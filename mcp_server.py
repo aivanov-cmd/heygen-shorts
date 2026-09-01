@@ -792,11 +792,55 @@ if __name__ == "__main__":
             flush=True,
         )
 
-    mcp_app = mcp.streamable_http_app()
+    from starlette.applications import Starlette
+from starlette.responses import FileResponse, JSONResponse
+from starlette.routing import Mount, Route
+from pathlib import Path
 
-    app = APIKeyMiddleware(
-        mcp_app,
+
+async def download_video_endpoint(request):
+    short_id = request.path_params["short_id"]
+
+    file_path = Path(
+        f"/tmp/heygen_shorts/short_{short_id}.mp4"
     )
+
+    if not file_path.exists():
+        return JSONResponse(
+            {
+                "success": False,
+                "error": "Video file not found",
+                "short_id": short_id,
+            },
+            status_code=404,
+        )
+
+    return FileResponse(
+        path=str(file_path),
+        media_type="video/mp4",
+        filename=f"short_{short_id}.mp4",
+    )
+
+
+mcp_app = mcp.streamable_http_app()
+
+inner_app = Starlette(
+    routes=[
+        Route(
+            "/download/{short_id:int}",
+            download_video_endpoint,
+            methods=["GET"],
+        ),
+        Mount(
+            "/",
+            app=mcp_app,
+        ),
+    ]
+)
+
+app = APIKeyMiddleware(
+    inner_app,
+)
 
     uvicorn.run(
         app,
