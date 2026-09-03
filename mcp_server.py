@@ -2,6 +2,7 @@ import os
 import hmac
 import psycopg2
 
+from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
@@ -12,12 +13,17 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 MCP_API_KEY = os.environ.get("MCP_API_KEY")
+VIDEO_DOWNLOAD_API_KEY = os.environ.get("VIDEO_DOWNLOAD_API_KEY")
+
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not configured")
 
 if not MCP_API_KEY:
     raise RuntimeError("MCP_API_KEY is not configured")
+
+if not VIDEO_DOWNLOAD_API_KEY:
+    raise RuntimeError("VIDEO_DOWNLOAD_API_KEY is not configured")
 
 
 def get_db():
@@ -603,8 +609,9 @@ def mark_failed(
         cur.close()
         conn.close()
 
+
 # =========================================================
-# VIDEO DOWNLOAD
+# VIDEO DOWNLOAD TO RAILWAY VOLUME
 # =========================================================
 
 @mcp.tool()
@@ -618,7 +625,6 @@ def download_completed_video(short_id: int) -> dict:
     """
 
     import urllib.request
-    from pathlib import Path
 
     conn = get_db()
     cur = conn.cursor()
@@ -683,7 +689,9 @@ def download_completed_video(short_id: int) -> dict:
             request,
             timeout=120,
         ) as response:
+
             with open(file_path, "wb") as output:
+
                 while True:
                     chunk = response.read(1024 * 1024)
 
@@ -693,6 +701,7 @@ def download_completed_video(short_id: int) -> dict:
                     output.write(chunk)
 
     except Exception as exc:
+
         if file_path.exists():
             file_path.unlink()
 
@@ -712,16 +721,43 @@ def download_completed_video(short_id: int) -> dict:
         "size_bytes": file_size,
         "size_mb": round(file_size / 1024 / 1024, 2),
         "temporary": False,
-"persistent_storage": True,
+        "persistent_storage": True,
     }
+
+
 # =========================================================
-# API KEY PROTECTION
+# API KEY PROTECTION + VIDEO DELIVERY FOR N8N
 # =========================================================
 
 class APIKeyMiddleware:
-
     def __init__(self, app):
         self.app = app
+
+    async def send_json(
+        self,
+        send,
+        status_code: int,
+        body: bytes,
+    ):
+        await send({
+            "type": "http.response.start",
+            "status": status_code,
+            "headers": [
+                (
+                    b"content-type",
+                    b"application/json",
+                ),
+                (
+                    b"content-length",
+                    str(len(body)).encode(),
+                ),
+            ],
+        })
+
+        await send({
+            "type": "http.response.body",
+            "body": body,
+        })
 
     async def __call__(self, scope, receive, send):
 
@@ -730,39 +766,122 @@ class APIKeyMiddleware:
             return
 
         headers = {
-            key.decode("latin-1").lower(): value.decode("latin-1")
+            key.decode("latin-1").lower():
+                value.decode("latin-1")
             for key, value in scope.get("headers", [])
         }
 
         supplied_key = headers.get("x-api-key", "")
+        path = scope.get("path", "")
+
+        # =====================================================
+        # VIDEO ENDPOINT FOR N8N
+        #
+        # Example:
+        # GET /video/5
+        #
+        # Returns:
+        # /videos/short_5.mp4
+        # =====================================================
+
+        if path.startswith("/video/"):
+
+            if not hmac.compare_digest(
+                supplied_key,
+                VIDEO_DOWNLOAD_API_KEY,
+            ):
+                await self.send_json(
+                    send,
+                    401,
+                    b'{"error":"Unauthorized"}',
+                )
+                return
+
+            short_id_text = path[len("/video/"):].strip("/")
+
+            if not short_id_text.isdigit():
+                await self.send_json(
+                    send,
+                    400,
+                    b'{"error":"Invalid short_id"}',
+                )
+                return
+
+            short_id = int(short_id_text)
+
+            file_path = Path(
+                f"/videos/short_{short_id}.mp4"
+            )
+
+            if not file_path.is_file():
+                await self.send_json(
+                    send,
+                    404,
+                    b'{"error":"Video not found"}',
+                )
+                return
+
+            file_size = file_path.stat().st_size
+
+            await send({
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (
+                        b"content-type",
+                        b"video/mp4",
+                    ),
+                    (
+                        b"content-length",
+                        str(file_size).encode(),
+                    ),
+                    (
+                        b"content-disposition",
+                        (
+                            f'attachment; '
+                            f'filename="short_{short_id}.mp4"'
+                        ).encode(),
+                    ),
+                ],
+            })
+
+            with open(file_path, "rb") as video_file:
+
+                while True:
+                    chunk = video_file.read(
+                        1024 * 1024
+                    )
+
+                    if not chunk:
+                        break
+
+                    await send({
+                        "type": "http.response.body",
+                        "body": chunk,
+                        "more_body": True,
+                    })
+
+            await send({
+                "type": "http.response.body",
+                "body": b"",
+                "more_body": False,
+            })
+
+            return
+
+        # =====================================================
+        # NORMAL MCP AUTH
+        # =====================================================
 
         if not hmac.compare_digest(
             supplied_key,
             MCP_API_KEY,
         ):
-
-            body = b'{"error":"Unauthorized"}'
-
-            await send({
-                "type": "http.response.start",
-                "status": 401,
-                "headers": [
-                    (
-                        b"content-type",
-                        b"application/json",
-                    ),
-                    (
-                        b"content-length",
-                        str(len(body)).encode(),
-                    ),
-                ],
-            })
-
-            await send({
-                "type": "http.response.body",
-                "body": body,
-            })
-
+            await self.send_json(
+                send,
+                401,
+                b'{"error":"Unauthorized"}',
+            )
             return
 
         await self.app(
@@ -777,6 +896,7 @@ class APIKeyMiddleware:
 # =========================================================
 
 if __name__ == "__main__":
+
     import uvicorn
 
     registered_tools = mcp._tool_manager.list_tools()
