@@ -1,8 +1,11 @@
 import os
 import hmac
 import json
+import time
+import hashlib
 import urllib.request
 import urllib.error
+import urllib.parse
 
 import psycopg2
 
@@ -22,37 +25,71 @@ VIDEO_DOWNLOAD_API_KEY = os.environ.get("VIDEO_DOWNLOAD_API_KEY")
 N8N_YOUTUBE_WEBHOOK_URL = os.environ.get("N8N_YOUTUBE_WEBHOOK_URL")
 N8N_YOUTUBE_WEBHOOK_KEY = os.environ.get("N8N_YOUTUBE_WEBHOOK_KEY")
 
-# Если в n8n Header Auth ты использовал именно это имя,
-# ничего менять не нужно.
 N8N_YOUTUBE_WEBHOOK_HEADER = os.environ.get(
     "N8N_YOUTUBE_WEBHOOK_HEADER",
     "x-publish-key",
 )
 
+N8N_INSTAGRAM_WEBHOOK_URL = os.environ.get(
+    "N8N_INSTAGRAM_WEBHOOK_URL"
+)
+
+N8N_INSTAGRAM_WEBHOOK_KEY = os.environ.get(
+    "N8N_INSTAGRAM_WEBHOOK_KEY"
+)
+
+N8N_INSTAGRAM_WEBHOOK_HEADER = os.environ.get(
+    "N8N_INSTAGRAM_WEBHOOK_HEADER",
+    "x-instagram-publish-key",
+)
+
+INSTAGRAM_VIDEO_URL_TTL_SECONDS = int(
+    os.environ.get(
+        "INSTAGRAM_VIDEO_URL_TTL_SECONDS",
+        "21600",
+    )
+)
+
 
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not configured")
+    raise RuntimeError(
+        "DATABASE_URL is not configured"
+    )
 
 if not MCP_API_KEY:
-    raise RuntimeError("MCP_API_KEY is not configured")
+    raise RuntimeError(
+        "MCP_API_KEY is not configured"
+    )
 
 if not VIDEO_DOWNLOAD_API_KEY:
-    raise RuntimeError("VIDEO_DOWNLOAD_API_KEY is not configured")
+    raise RuntimeError(
+        "VIDEO_DOWNLOAD_API_KEY is not configured"
+    )
 
 if not N8N_YOUTUBE_WEBHOOK_URL:
-    raise RuntimeError("N8N_YOUTUBE_WEBHOOK_URL is not configured")
+    raise RuntimeError(
+        "N8N_YOUTUBE_WEBHOOK_URL is not configured"
+    )
 
 if not N8N_YOUTUBE_WEBHOOK_KEY:
-    raise RuntimeError("N8N_YOUTUBE_WEBHOOK_KEY is not configured")
+    raise RuntimeError(
+        "N8N_YOUTUBE_WEBHOOK_KEY is not configured"
+    )
 
 
 def get_db():
-    return psycopg2.connect(DATABASE_URL)
+    return psycopg2.connect(
+        DATABASE_URL
+    )
 
+
+# =========================================================
+# DATABASE SCHEMA
+# =========================================================
 
 def ensure_database_schema():
     """
-    Add YouTube-related columns if they do not exist yet.
+    Add YouTube and Instagram columns if missing.
     Safe to run on every service start.
     """
 
@@ -60,6 +97,11 @@ def ensure_database_schema():
     cur = conn.cursor()
 
     try:
+
+        # -------------------------
+        # YouTube
+        # -------------------------
+
         cur.execute(
             """
             ALTER TABLE shorts
@@ -104,6 +146,47 @@ def ensure_database_schema():
             """
         )
 
+        # -------------------------
+        # Instagram
+        # -------------------------
+
+        cur.execute(
+            """
+            ALTER TABLE shorts
+            ADD COLUMN IF NOT EXISTS instagram_caption TEXT
+            """
+        )
+
+        cur.execute(
+            """
+            ALTER TABLE shorts
+            ADD COLUMN IF NOT EXISTS instagram_media_id TEXT
+            """
+        )
+
+        cur.execute(
+            """
+            ALTER TABLE shorts
+            ADD COLUMN IF NOT EXISTS instagram_status TEXT
+            DEFAULT 'pending'
+            """
+        )
+
+        cur.execute(
+            """
+            ALTER TABLE shorts
+            ADD COLUMN IF NOT EXISTS instagram_last_error TEXT
+            """
+        )
+
+        cur.execute(
+            """
+            UPDATE shorts
+            SET instagram_status = 'pending'
+            WHERE instagram_status IS NULL
+            """
+        )
+
         conn.commit()
 
     except Exception:
@@ -119,7 +202,13 @@ def ensure_database_schema():
 # MCP SERVER
 # =========================================================
 
-RAILWAY_HOST = "diplomatic-vitality-production-e565.up.railway.app"
+RAILWAY_HOST = (
+    "diplomatic-vitality-production-e565.up.railway.app"
+)
+
+RAILWAY_BASE_URL = (
+    f"https://{RAILWAY_HOST}"
+)
 
 transport_security = TransportSecuritySettings(
     enable_dns_rebinding_protection=True,
@@ -142,17 +231,81 @@ mcp = FastMCP(
 
 
 # =========================================================
+# INSTAGRAM SIGNED VIDEO URL
+# =========================================================
+
+def create_instagram_video_signature(
+    short_id: int,
+    expires: int,
+) -> str:
+
+    if not N8N_INSTAGRAM_WEBHOOK_KEY:
+        raise RuntimeError(
+            "N8N_INSTAGRAM_WEBHOOK_KEY "
+            "is not configured"
+        )
+
+    message = (
+        f"{short_id}:{expires}"
+    ).encode("utf-8")
+
+    return hmac.new(
+        N8N_INSTAGRAM_WEBHOOK_KEY.encode(
+            "utf-8"
+        ),
+        message,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def create_instagram_video_url(
+    short_id: int,
+) -> dict:
+
+    expires = (
+        int(time.time())
+        + INSTAGRAM_VIDEO_URL_TTL_SECONDS
+    )
+
+    signature = (
+        create_instagram_video_signature(
+            short_id,
+            expires,
+        )
+    )
+
+    url = (
+        f"{RAILWAY_BASE_URL}"
+        f"/instagram-video/{short_id}"
+        f"?expires={expires}"
+        f"&signature={signature}"
+    )
+
+    return {
+        "url": url,
+        "expires": expires,
+        "ttl_seconds":
+            INSTAGRAM_VIDEO_URL_TTL_SECONDS,
+    }
+
+
+# =========================================================
 # READ-ONLY TOOLS
 # =========================================================
 
 @mcp.tool()
-def get_approved_shorts(limit: int = 30) -> dict:
+def get_approved_shorts(
+    limit: int = 30,
+) -> dict:
     """
     Get approved Shorts waiting for HeyGen generation.
     Read-only.
     """
 
-    limit = max(1, min(limit, 30))
+    limit = max(
+        1,
+        min(limit, 30),
+    )
 
     conn = get_db()
     cur = conn.cursor()
@@ -169,7 +322,9 @@ def get_approved_shorts(limit: int = 30) -> dict:
                 status,
                 youtube_title,
                 youtube_description,
-                youtube_status
+                youtube_status,
+                instagram_caption,
+                instagram_status
             FROM shorts
             WHERE status = 'approved'
               AND heygen_video_id IS NULL
@@ -188,6 +343,7 @@ def get_approved_shorts(limit: int = 30) -> dict:
     shorts = []
 
     for row in rows:
+
         shorts.append({
             "id": row[0],
             "topic": row[1],
@@ -198,6 +354,8 @@ def get_approved_shorts(limit: int = 30) -> dict:
             "youtube_title": row[6],
             "youtube_description": row[7],
             "youtube_status": row[8],
+            "instagram_caption": row[9],
+            "instagram_status": row[10],
         })
 
     return {
@@ -207,7 +365,9 @@ def get_approved_shorts(limit: int = 30) -> dict:
 
 
 @mcp.tool()
-def get_short(short_id: int) -> dict:
+def get_short(
+    short_id: int,
+) -> dict:
     """
     Get one Short by ID.
     Read-only.
@@ -234,7 +394,11 @@ def get_short(short_id: int) -> dict:
                 youtube_description,
                 youtube_video_id,
                 youtube_status,
-                youtube_last_error
+                youtube_last_error,
+                instagram_caption,
+                instagram_media_id,
+                instagram_status,
+                instagram_last_error
             FROM shorts
             WHERE id = %s
             """,
@@ -266,11 +430,17 @@ def get_short(short_id: int) -> dict:
             "video_url": row[7],
             "subtitle_url": row[8],
             "last_error": row[9],
+
             "youtube_title": row[10],
             "youtube_description": row[11],
             "youtube_video_id": row[12],
             "youtube_status": row[13],
             "youtube_last_error": row[14],
+
+            "instagram_caption": row[15],
+            "instagram_media_id": row[16],
+            "instagram_status": row[17],
+            "instagram_last_error": row[18],
         },
     }
 
@@ -286,6 +456,7 @@ def get_queue_stats() -> dict:
     cur = conn.cursor()
 
     try:
+
         cur.execute(
             """
             SELECT status, COUNT(*)
@@ -305,6 +476,16 @@ def get_queue_stats() -> dict:
         )
 
         youtube_rows = cur.fetchall()
+
+        cur.execute(
+            """
+            SELECT instagram_status, COUNT(*)
+            FROM shorts
+            GROUP BY instagram_status
+            """
+        )
+
+        instagram_rows = cur.fetchall()
 
     finally:
         cur.close()
@@ -335,10 +516,22 @@ def get_queue_stats() -> dict:
         if status:
             youtube_stats[status] = count
 
+    instagram_stats = {
+        "pending": 0,
+        "requested": 0,
+        "published": 0,
+        "failed": 0,
+    }
+
+    for status, count in instagram_rows:
+        if status:
+            instagram_stats[status] = count
+
     return {
         "total": total,
         **stats,
         "youtube": youtube_stats,
+        "instagram": instagram_stats,
     }
 
 
@@ -347,11 +540,13 @@ def get_queue_stats() -> dict:
 # =========================================================
 
 @mcp.tool()
-def create_shorts_batch(shorts: list[dict]) -> dict:
+def create_shorts_batch(
+    shorts: list[dict],
+) -> dict:
     """
     Create new approved Shorts in PostgreSQL.
 
-    Required fields for every Short:
+    Required:
     - topic
     - script
     - avatar_id
@@ -359,97 +554,148 @@ def create_shorts_batch(shorts: list[dict]) -> dict:
     - youtube_title
     - youtube_description
 
+    Optional:
+    - instagram_caption
+
+    If instagram_caption is omitted,
+    youtube_description is used.
+
     Maximum 30 Shorts per request.
 
-    This tool only creates database records.
-    It does NOT call HeyGen.
-    It does NOT publish to YouTube.
+    Does NOT generate or publish anything.
     """
 
     if not shorts:
         return {
             "success": False,
-            "error": "shorts list cannot be empty",
+            "error":
+                "shorts list cannot be empty",
         }
 
     if len(shorts) > 30:
         return {
             "success": False,
-            "error": "Maximum 30 Shorts per batch",
+            "error":
+                "Maximum 30 Shorts per batch",
         }
 
     validated = []
 
-    for index, item in enumerate(shorts, start=1):
+    for index, item in enumerate(
+        shorts,
+        start=1,
+    ):
 
-        topic = str(item.get("topic", "")).strip()
-        script = str(item.get("script", "")).strip()
-        avatar_id = str(item.get("avatar_id", "")).strip()
-        voice_id = str(item.get("voice_id", "")).strip()
+        topic = str(
+            item.get("topic", "")
+        ).strip()
+
+        script = str(
+            item.get("script", "")
+        ).strip()
+
+        avatar_id = str(
+            item.get("avatar_id", "")
+        ).strip()
+
+        voice_id = str(
+            item.get("voice_id", "")
+        ).strip()
 
         youtube_title = str(
-            item.get("youtube_title", "")
+            item.get(
+                "youtube_title",
+                "",
+            )
         ).strip()
 
         youtube_description = str(
-            item.get("youtube_description", "")
+            item.get(
+                "youtube_description",
+                "",
+            )
+        ).strip()
+
+        instagram_caption = str(
+            item.get(
+                "instagram_caption",
+                "",
+            )
         ).strip()
 
         if not topic:
             return {
                 "success": False,
-                "error": f"Short #{index}: topic is required",
+                "error":
+                    f"Short #{index}: "
+                    "topic is required",
             }
 
         if not script:
             return {
                 "success": False,
-                "error": f"Short #{index}: script is required",
+                "error":
+                    f"Short #{index}: "
+                    "script is required",
             }
 
         if not avatar_id:
             return {
                 "success": False,
-                "error": f"Short #{index}: avatar_id is required",
+                "error":
+                    f"Short #{index}: "
+                    "avatar_id is required",
             }
 
         if not voice_id:
             return {
                 "success": False,
-                "error": f"Short #{index}: voice_id is required",
+                "error":
+                    f"Short #{index}: "
+                    "voice_id is required",
             }
 
         if not youtube_title:
             return {
                 "success": False,
-                "error": f"Short #{index}: youtube_title is required",
+                "error":
+                    f"Short #{index}: "
+                    "youtube_title is required",
             }
 
         if not youtube_description:
             return {
                 "success": False,
-                "error": (
+                "error":
                     f"Short #{index}: "
-                    "youtube_description is required"
-                ),
+                    "youtube_description is required",
             }
 
         if len(youtube_title) > 100:
             return {
                 "success": False,
-                "error": (
+                "error":
                     f"Short #{index}: "
-                    "youtube_title must be 100 characters or less"
-                ),
+                    "youtube_title must be "
+                    "100 characters or less",
             }
+
+        if not instagram_caption:
+            instagram_caption = (
+                youtube_description
+            )
 
         validated.append({
             "topic": topic,
             "script": script,
             "avatar_id": avatar_id,
             "voice_id": voice_id,
-            "youtube_title": youtube_title,
-            "youtube_description": youtube_description,
+            "youtube_title":
+                youtube_title,
+            "youtube_description":
+                youtube_description,
+            "instagram_caption":
+                instagram_caption,
         })
 
     conn = get_db()
@@ -469,15 +715,23 @@ def create_shorts_batch(shorts: list[dict]) -> dict:
                     avatar_id,
                     voice_id,
                     status,
+
                     heygen_video_id,
                     video_url,
                     subtitle_url,
                     last_error,
+
                     youtube_title,
                     youtube_description,
                     youtube_video_id,
                     youtube_status,
                     youtube_last_error,
+
+                    instagram_caption,
+                    instagram_media_id,
+                    instagram_status,
+                    instagram_last_error,
+
                     created_at,
                     updated_at
                 )
@@ -487,15 +741,23 @@ def create_shorts_batch(shorts: list[dict]) -> dict:
                     %s,
                     %s,
                     'approved',
+
                     NULL,
                     NULL,
                     NULL,
                     NULL,
+
                     %s,
                     %s,
                     NULL,
                     'pending',
                     NULL,
+
+                    %s,
+                    NULL,
+                    'pending',
+                    NULL,
+
                     NOW(),
                     NOW()
                 )
@@ -507,7 +769,9 @@ def create_shorts_batch(shorts: list[dict]) -> dict:
                     voice_id,
                     youtube_title,
                     youtube_description,
-                    youtube_status
+                    youtube_status,
+                    instagram_caption,
+                    instagram_status
                 """,
                 (
                     item["topic"],
@@ -516,6 +780,7 @@ def create_shorts_batch(shorts: list[dict]) -> dict:
                     item["voice_id"],
                     item["youtube_title"],
                     item["youtube_description"],
+                    item["instagram_caption"],
                 ),
             )
 
@@ -530,6 +795,8 @@ def create_shorts_batch(shorts: list[dict]) -> dict:
                 "youtube_title": row[5],
                 "youtube_description": row[6],
                 "youtube_status": row[7],
+                "instagram_caption": row[8],
+                "instagram_status": row[9],
             })
 
         conn.commit()
@@ -554,11 +821,12 @@ def create_shorts_batch(shorts: list[dict]) -> dict:
 # =========================================================
 
 @mcp.tool()
-def mark_generating(short_id: int) -> dict:
+def mark_generating(
+    short_id: int,
+) -> dict:
     """
     Mark an approved Short as generating.
 
-    Allowed transition:
     approved -> generating
     """
 
@@ -590,8 +858,9 @@ def mark_generating(short_id: int) -> dict:
             return {
                 "success": False,
                 "error": (
-                    "Short not found or is not eligible for "
-                    "approved -> generating transition"
+                    "Short not found or is not "
+                    "eligible for approved -> "
+                    "generating transition"
                 ),
                 "short_id": short_id,
             }
@@ -621,31 +890,33 @@ def mark_completed(
     subtitle_url: str | None = None,
 ) -> dict:
     """
-    Mark a generating Short as completed
-    and save the HeyGen result.
+    Mark generating Short as completed.
 
-    Allowed transition:
     generating -> completed
 
-    IMPORTANT:
-    For videos requiring burned-in subtitles,
-    pass HeyGen captioned_video_url as video_url.
+    For burned subtitles use
+    captioned_video_url as video_url.
     """
 
-    heygen_video_id = heygen_video_id.strip()
+    heygen_video_id = (
+        heygen_video_id.strip()
+    )
+
     video_url = video_url.strip()
 
     if not heygen_video_id:
         return {
             "success": False,
-            "error": "heygen_video_id cannot be empty",
+            "error":
+                "heygen_video_id cannot be empty",
             "short_id": short_id,
         }
 
     if not video_url:
         return {
             "success": False,
-            "error": "video_url cannot be empty",
+            "error":
+                "video_url cannot be empty",
             "short_id": short_id,
         }
 
@@ -689,8 +960,9 @@ def mark_completed(
             return {
                 "success": False,
                 "error": (
-                    "Short not found or is not eligible for "
-                    "generating -> completed transition"
+                    "Short not found or is not "
+                    "eligible for generating -> "
+                    "completed transition"
                 ),
                 "short_id": short_id,
             }
@@ -721,19 +993,20 @@ def mark_failed(
     error_message: str,
 ) -> dict:
     """
-    Mark a generating Short as failed
-    and save the error.
+    Mark generating Short as failed.
 
-    Allowed transition:
     generating -> failed
     """
 
-    error_message = error_message.strip()
+    error_message = (
+        error_message.strip()
+    )
 
     if not error_message:
         return {
             "success": False,
-            "error": "error_message cannot be empty",
+            "error":
+                "error_message cannot be empty",
             "short_id": short_id,
         }
 
@@ -770,8 +1043,9 @@ def mark_failed(
             return {
                 "success": False,
                 "error": (
-                    "Short not found or is not eligible for "
-                    "generating -> failed transition"
+                    "Short not found or is not "
+                    "eligible for generating -> "
+                    "failed transition"
                 ),
                 "short_id": short_id,
             }
@@ -799,22 +1073,25 @@ def mark_failed(
 # =========================================================
 
 @mcp.tool()
-def download_completed_video(short_id: int) -> dict:
+def download_completed_video(
+    short_id: int,
+) -> dict:
     """
-    Download the completed captioned MP4 stored in video_url.
-
-    Read-only for PostgreSQL.
-    Does NOT call HeyGen generation.
-    Does NOT change Short status.
+    Download captioned completed MP4
+    to persistent Railway Volume.
     """
 
     conn = get_db()
     cur = conn.cursor()
 
     try:
+
         cur.execute(
             """
-            SELECT id, status, video_url
+            SELECT
+                id,
+                status,
+                video_url
             FROM shorts
             WHERE id = %s
             """,
@@ -834,12 +1111,17 @@ def download_completed_video(short_id: int) -> dict:
             "short_id": short_id,
         }
 
-    short_id_db, status, video_url = row
+    (
+        short_id_db,
+        status,
+        video_url,
+    ) = row
 
     if status != "completed":
         return {
             "success": False,
-            "error": "Short is not completed",
+            "error":
+                "Short is not completed",
             "short_id": short_id,
             "status": status,
         }
@@ -851,19 +1133,27 @@ def download_completed_video(short_id: int) -> dict:
             "short_id": short_id,
         }
 
-    download_dir = Path("/videos")
+    download_dir = Path(
+        "/videos"
+    )
+
     download_dir.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    file_path = download_dir / f"short_{short_id_db}.mp4"
+    file_path = (
+        download_dir
+        / f"short_{short_id_db}.mp4"
+    )
 
     try:
+
         request = urllib.request.Request(
             video_url,
             headers={
-                "User-Agent": "Mozilla/5.0",
+                "User-Agent":
+                    "Mozilla/5.0",
             },
         )
 
@@ -872,10 +1162,16 @@ def download_completed_video(short_id: int) -> dict:
             timeout=120,
         ) as response:
 
-            with open(file_path, "wb") as output:
+            with open(
+                file_path,
+                "wb",
+            ) as output:
 
                 while True:
-                    chunk = response.read(1024 * 1024)
+
+                    chunk = response.read(
+                        1024 * 1024
+                    )
 
                     if not chunk:
                         break
@@ -889,11 +1185,14 @@ def download_completed_video(short_id: int) -> dict:
 
         return {
             "success": False,
-            "error": f"Download failed: {exc}",
+            "error":
+                f"Download failed: {exc}",
             "short_id": short_id,
         }
 
-    file_size = file_path.stat().st_size
+    file_size = (
+        file_path.stat().st_size
+    )
 
     return {
         "success": True,
@@ -902,7 +1201,9 @@ def download_completed_video(short_id: int) -> dict:
         "file_path": str(file_path),
         "size_bytes": file_size,
         "size_mb": round(
-            file_size / 1024 / 1024,
+            file_size
+            / 1024
+            / 1024,
             2,
         ),
         "temporary": False,
@@ -920,25 +1221,20 @@ def publish_to_youtube(
     force: bool = False,
 ) -> dict:
     """
-    Send a completed Short to the protected n8n YouTube workflow.
+    Send completed Short to protected
+    n8n YouTube workflow.
 
-    Requirements:
-    - Short status must be completed
-    - /videos/short_ID.mp4 must exist
-    - youtube_title must exist
-    - youtube_description must exist
+    Successful response only means
+    n8n accepted the request.
 
-    force=False prevents accidental duplicate publication.
-
-    IMPORTANT:
-    A successful response means n8n accepted the publication request.
-    Final YouTube success is confirmed later through the callback endpoint.
+    Final success comes through callback.
     """
 
     conn = get_db()
     cur = conn.cursor()
 
     try:
+
         cur.execute(
             """
             SELECT
@@ -963,7 +1259,8 @@ def publish_to_youtube(
     if not row:
         return {
             "success": False,
-            "error": "Short not found",
+            "error":
+                "Short not found",
             "short_id": short_id,
         }
 
@@ -979,7 +1276,8 @@ def publish_to_youtube(
     if status != "completed":
         return {
             "success": False,
-            "error": "Short is not completed",
+            "error":
+                "Short is not completed",
             "short_id": short_id,
             "status": status,
         }
@@ -992,8 +1290,9 @@ def publish_to_youtube(
         return {
             "success": False,
             "error": (
-                "Video file is not stored in Railway Volume. "
-                "Run download_completed_video first."
+                "Video file is not stored in "
+                "Railway Volume. Run "
+                "download_completed_video first."
             ),
             "short_id": short_id,
         }
@@ -1001,42 +1300,53 @@ def publish_to_youtube(
     if not youtube_title:
         return {
             "success": False,
-            "error": "youtube_title is empty",
+            "error":
+                "youtube_title is empty",
             "short_id": short_id,
         }
 
     if not youtube_description:
         return {
             "success": False,
-            "error": "youtube_description is empty",
+            "error":
+                "youtube_description is empty",
             "short_id": short_id,
         }
 
     if not force:
+
         if youtube_status == "published":
             return {
                 "success": False,
-                "error": "Short is already published on YouTube",
+                "error":
+                    "Short is already published "
+                    "on YouTube",
                 "short_id": short_id,
-                "youtube_video_id": youtube_video_id,
-                "youtube_status": youtube_status,
+                "youtube_video_id":
+                    youtube_video_id,
+                "youtube_status":
+                    youtube_status,
             }
 
         if youtube_status == "requested":
             return {
                 "success": False,
                 "error": (
-                    "YouTube publication has already been requested. "
-                    "Use force=true only if you intentionally want to retry."
+                    "YouTube publication has "
+                    "already been requested. "
+                    "Use force=true only for "
+                    "an intentional retry."
                 ),
                 "short_id": short_id,
-                "youtube_status": youtube_status,
+                "youtube_status":
+                    youtube_status,
             }
 
     payload = {
         "short_id": short_id,
         "title": youtube_title,
-        "description": youtube_description,
+        "description":
+            youtube_description,
     }
 
     body = json.dumps(
@@ -1049,38 +1359,49 @@ def publish_to_youtube(
         data=body,
         method="POST",
         headers={
-            "Content-Type": "application/json",
+            "Content-Type":
+                "application/json",
             N8N_YOUTUBE_WEBHOOK_HEADER:
                 N8N_YOUTUBE_WEBHOOK_KEY,
         },
     )
 
     try:
+
         with urllib.request.urlopen(
             request,
             timeout=30,
         ) as response:
 
-            response_status = response.status
+            response_status = (
+                response.status
+            )
 
-            response_body = response.read(
-                1024 * 1024
-            ).decode(
-                "utf-8",
-                errors="replace",
+            response_body = (
+                response.read(
+                    1024 * 1024
+                )
+                .decode(
+                    "utf-8",
+                    errors="replace",
+                )
             )
 
     except urllib.error.HTTPError as exc:
 
-        error_body = exc.read().decode(
-            "utf-8",
-            errors="replace",
+        error_body = (
+            exc.read()
+            .decode(
+                "utf-8",
+                errors="replace",
+            )
         )
 
         conn = get_db()
         cur = conn.cursor()
 
         try:
+
             cur.execute(
                 """
                 UPDATE shorts
@@ -1092,7 +1413,8 @@ def publish_to_youtube(
                 """,
                 (
                     (
-                        f"n8n HTTP {exc.code}: "
+                        f"n8n HTTP "
+                        f"{exc.code}: "
                         f"{error_body}"
                     )[:2000],
                     short_id,
@@ -1107,9 +1429,12 @@ def publish_to_youtube(
 
         return {
             "success": False,
-            "error": f"n8n HTTP error {exc.code}",
+            "error":
+                f"n8n HTTP error "
+                f"{exc.code}",
             "short_id": short_id,
-            "details": error_body[:1000],
+            "details":
+                error_body[:1000],
         }
 
     except Exception as exc:
@@ -1118,6 +1443,7 @@ def publish_to_youtube(
         cur = conn.cursor()
 
         try:
+
             cur.execute(
                 """
                 UPDATE shorts
@@ -1141,15 +1467,19 @@ def publish_to_youtube(
 
         return {
             "success": False,
-            "error": f"Failed to call n8n: {exc}",
+            "error":
+                f"Failed to call n8n: {exc}",
             "short_id": short_id,
         }
 
-    if response_status < 200 or response_status >= 300:
+    if (
+        response_status < 200
+        or response_status >= 300
+    ):
         return {
             "success": False,
             "error": (
-                f"Unexpected n8n status "
+                "Unexpected n8n status "
                 f"{response_status}"
             ),
             "short_id": short_id,
@@ -1159,6 +1489,7 @@ def publish_to_youtube(
     cur = conn.cursor()
 
     try:
+
         cur.execute(
             """
             UPDATE shorts
@@ -1180,23 +1511,454 @@ def publish_to_youtube(
     return {
         "success": True,
         "short_id": short_id,
-        "youtube_status": "requested",
+        "youtube_status":
+            "requested",
         "message": (
-            "Publication request accepted by n8n. "
-            "Waiting for YouTube callback."
+            "Publication request accepted "
+            "by n8n. Waiting for "
+            "YouTube callback."
         ),
-        "n8n_http_status": response_status,
-        "n8n_response": response_body[:1000],
+        "n8n_http_status":
+            response_status,
+        "n8n_response":
+            response_body[:1000],
     }
 
 
 # =========================================================
-# API KEY PROTECTION + VIDEO DELIVERY + YOUTUBE CALLBACK
+# INSTAGRAM PUBLISH VIA N8N
+# =========================================================
+
+@mcp.tool()
+def publish_to_instagram(
+    short_id: int,
+    force: bool = False,
+) -> dict:
+    """
+    Send completed Short to protected
+    n8n Instagram Reels workflow.
+
+    The video is exposed to Meta through
+    a temporary HMAC-signed URL.
+
+    Successful response only means
+    n8n accepted the request.
+
+    Final success comes through callback.
+    """
+
+    if not N8N_INSTAGRAM_WEBHOOK_URL:
+        return {
+            "success": False,
+            "error": (
+                "N8N_INSTAGRAM_WEBHOOK_URL "
+                "is not configured"
+            ),
+        }
+
+    if not N8N_INSTAGRAM_WEBHOOK_KEY:
+        return {
+            "success": False,
+            "error": (
+                "N8N_INSTAGRAM_WEBHOOK_KEY "
+                "is not configured"
+            ),
+        }
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    try:
+
+        cur.execute(
+            """
+            SELECT
+                id,
+                topic,
+                status,
+                youtube_title,
+                youtube_description,
+                instagram_caption,
+                instagram_media_id,
+                instagram_status
+            FROM shorts
+            WHERE id = %s
+            """,
+            (short_id,),
+        )
+
+        row = cur.fetchone()
+
+    finally:
+        cur.close()
+        conn.close()
+
+    if not row:
+        return {
+            "success": False,
+            "error":
+                "Short not found",
+            "short_id": short_id,
+        }
+
+    (
+        short_id_db,
+        topic,
+        status,
+        youtube_title,
+        youtube_description,
+        instagram_caption,
+        instagram_media_id,
+        instagram_status,
+    ) = row
+
+    if status != "completed":
+        return {
+            "success": False,
+            "error":
+                "Short is not completed",
+            "short_id": short_id,
+            "status": status,
+        }
+
+    file_path = Path(
+        f"/videos/short_{short_id_db}.mp4"
+    )
+
+    if not file_path.is_file():
+        return {
+            "success": False,
+            "error": (
+                "Video file is not stored in "
+                "Railway Volume. Run "
+                "download_completed_video first."
+            ),
+            "short_id": short_id,
+        }
+
+    if not force:
+
+        if (
+            instagram_status
+            == "published"
+        ):
+            return {
+                "success": False,
+                "error": (
+                    "Short is already "
+                    "published on Instagram"
+                ),
+                "short_id": short_id,
+                "instagram_media_id":
+                    instagram_media_id,
+                "instagram_status":
+                    instagram_status,
+            }
+
+        if (
+            instagram_status
+            == "requested"
+        ):
+            return {
+                "success": False,
+                "error": (
+                    "Instagram publication "
+                    "has already been requested. "
+                    "Use force=true only for "
+                    "an intentional retry."
+                ),
+                "short_id": short_id,
+                "instagram_status":
+                    instagram_status,
+            }
+
+    final_caption = (
+        instagram_caption
+        or youtube_description
+        or youtube_title
+        or topic
+        or ""
+    ).strip()
+
+    if not final_caption:
+        return {
+            "success": False,
+            "error":
+                "Instagram caption is empty",
+            "short_id": short_id,
+        }
+
+    # Persist fallback caption if needed.
+    if not instagram_caption:
+
+        conn = get_db()
+        cur = conn.cursor()
+
+        try:
+
+            cur.execute(
+                """
+                UPDATE shorts
+                SET
+                    instagram_caption = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (
+                    final_caption,
+                    short_id,
+                ),
+            )
+
+            conn.commit()
+
+        finally:
+            cur.close()
+            conn.close()
+
+    signed_video = (
+        create_instagram_video_url(
+            short_id
+        )
+    )
+
+    payload = {
+        "short_id": short_id,
+        "caption": final_caption,
+        "video_url":
+            signed_video["url"],
+    }
+
+    body = json.dumps(
+        payload,
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    # Mark requested BEFORE calling n8n.
+    # This prevents a fast callback from
+    # being overwritten by requested later.
+    conn = get_db()
+    cur = conn.cursor()
+
+    try:
+
+        cur.execute(
+            """
+            UPDATE shorts
+            SET
+                instagram_status = 'requested',
+                instagram_last_error = NULL,
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (short_id,),
+        )
+
+        conn.commit()
+
+    finally:
+        cur.close()
+        conn.close()
+
+    request = urllib.request.Request(
+        N8N_INSTAGRAM_WEBHOOK_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type":
+                "application/json",
+            N8N_INSTAGRAM_WEBHOOK_HEADER:
+                N8N_INSTAGRAM_WEBHOOK_KEY,
+        },
+    )
+
+    try:
+
+        with urllib.request.urlopen(
+            request,
+            timeout=30,
+        ) as response:
+
+            response_status = (
+                response.status
+            )
+
+            response_body = (
+                response.read(
+                    1024 * 1024
+                )
+                .decode(
+                    "utf-8",
+                    errors="replace",
+                )
+            )
+
+    except urllib.error.HTTPError as exc:
+
+        error_body = (
+            exc.read()
+            .decode(
+                "utf-8",
+                errors="replace",
+            )
+        )
+
+        error_message = (
+            f"n8n HTTP {exc.code}: "
+            f"{error_body}"
+        )[:2000]
+
+        conn = get_db()
+        cur = conn.cursor()
+
+        try:
+
+            cur.execute(
+                """
+                UPDATE shorts
+                SET
+                    instagram_status = 'failed',
+                    instagram_last_error = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (
+                    error_message,
+                    short_id,
+                ),
+            )
+
+            conn.commit()
+
+        finally:
+            cur.close()
+            conn.close()
+
+        return {
+            "success": False,
+            "error":
+                f"n8n HTTP error "
+                f"{exc.code}",
+            "short_id": short_id,
+            "details":
+                error_body[:1000],
+        }
+
+    except Exception as exc:
+
+        error_message = (
+            str(exc)[:2000]
+        )
+
+        conn = get_db()
+        cur = conn.cursor()
+
+        try:
+
+            cur.execute(
+                """
+                UPDATE shorts
+                SET
+                    instagram_status = 'failed',
+                    instagram_last_error = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (
+                    error_message,
+                    short_id,
+                ),
+            )
+
+            conn.commit()
+
+        finally:
+            cur.close()
+            conn.close()
+
+        return {
+            "success": False,
+            "error":
+                f"Failed to call n8n: {exc}",
+            "short_id": short_id,
+        }
+
+    if (
+        response_status < 200
+        or response_status >= 300
+    ):
+
+        conn = get_db()
+        cur = conn.cursor()
+
+        try:
+
+            cur.execute(
+                """
+                UPDATE shorts
+                SET
+                    instagram_status = 'failed',
+                    instagram_last_error = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (
+                    (
+                        "Unexpected n8n status "
+                        f"{response_status}"
+                    ),
+                    short_id,
+                ),
+            )
+
+            conn.commit()
+
+        finally:
+            cur.close()
+            conn.close()
+
+        return {
+            "success": False,
+            "error": (
+                "Unexpected n8n status "
+                f"{response_status}"
+            ),
+            "short_id": short_id,
+        }
+
+    return {
+        "success": True,
+        "short_id": short_id,
+        "instagram_status":
+            "requested",
+        "message": (
+            "Instagram publication request "
+            "accepted by n8n. Waiting for "
+            "Instagram callback."
+        ),
+        "video_url_expires_at":
+            signed_video["expires"],
+        "video_url_ttl_seconds":
+            signed_video["ttl_seconds"],
+        "n8n_http_status":
+            response_status,
+        "n8n_response":
+            response_body[:1000],
+    }
+
+
+# =========================================================
+# API KEY PROTECTION
+# VIDEO DELIVERY
+# CALLBACKS
 # =========================================================
 
 class APIKeyMiddleware:
 
-    def __init__(self, app):
+    def __init__(
+        self,
+        app,
+    ):
         self.app = app
 
     async def send_json(
@@ -1205,14 +1967,17 @@ class APIKeyMiddleware:
         status_code: int,
         payload: dict,
     ):
+
         body = json.dumps(
             payload,
             ensure_ascii=False,
         ).encode("utf-8")
 
         await send({
-            "type": "http.response.start",
-            "status": status_code,
+            "type":
+                "http.response.start",
+            "status":
+                status_code,
             "headers": [
                 (
                     b"content-type",
@@ -1220,14 +1985,18 @@ class APIKeyMiddleware:
                 ),
                 (
                     b"content-length",
-                    str(len(body)).encode(),
+                    str(
+                        len(body)
+                    ).encode(),
                 ),
             ],
         })
 
         await send({
-            "type": "http.response.body",
-            "body": body,
+            "type":
+                "http.response.body",
+            "body":
+                body,
         })
 
     async def read_body(
@@ -1238,20 +2007,131 @@ class APIKeyMiddleware:
         chunks = []
 
         while True:
-            message = await receive()
 
-            if message["type"] != "http.request":
+            message = (
+                await receive()
+            )
+
+            if (
+                message["type"]
+                != "http.request"
+            ):
                 continue
 
-            body = message.get("body", b"")
+            body = message.get(
+                "body",
+                b"",
+            )
 
             if body:
-                chunks.append(body)
+                chunks.append(
+                    body
+                )
 
-            if not message.get("more_body", False):
+            if not message.get(
+                "more_body",
+                False,
+            ):
                 break
 
-        return b"".join(chunks)
+        return b"".join(
+            chunks
+        )
+
+    async def stream_video(
+        self,
+        send,
+        file_path: Path,
+        short_id: int,
+        method: str,
+        attachment: bool = False,
+    ):
+
+        file_size = (
+            file_path.stat().st_size
+        )
+
+        disposition_type = (
+            "attachment"
+            if attachment
+            else "inline"
+        )
+
+        await send({
+            "type":
+                "http.response.start",
+            "status":
+                200,
+            "headers": [
+                (
+                    b"content-type",
+                    b"video/mp4",
+                ),
+                (
+                    b"content-length",
+                    str(
+                        file_size
+                    ).encode(),
+                ),
+                (
+                    b"content-disposition",
+                    (
+                        f'{disposition_type}; '
+                        f'filename="short_'
+                        f'{short_id}.mp4"'
+                    ).encode(),
+                ),
+                (
+                    b"accept-ranges",
+                    b"bytes",
+                ),
+            ],
+        })
+
+        if method == "HEAD":
+
+            await send({
+                "type":
+                    "http.response.body",
+                "body":
+                    b"",
+                "more_body":
+                    False,
+            })
+
+            return
+
+        with open(
+            file_path,
+            "rb",
+        ) as video_file:
+
+            while True:
+
+                chunk = video_file.read(
+                    1024 * 1024
+                )
+
+                if not chunk:
+                    break
+
+                await send({
+                    "type":
+                        "http.response.body",
+                    "body":
+                        chunk,
+                    "more_body":
+                        True,
+                })
+
+        await send({
+            "type":
+                "http.response.body",
+            "body":
+                b"",
+            "more_body":
+                False,
+        })
 
     async def __call__(
         self,
@@ -1261,23 +2141,34 @@ class APIKeyMiddleware:
     ):
 
         if scope["type"] != "http":
+
             await self.app(
                 scope,
                 receive,
                 send,
             )
+
             return
 
         headers = {
-            key.decode("latin-1").lower():
-                value.decode("latin-1")
+            key.decode(
+                "latin-1"
+            ).lower():
+                value.decode(
+                    "latin-1"
+                )
             for key, value
-            in scope.get("headers", [])
+            in scope.get(
+                "headers",
+                [],
+            )
         }
 
-        supplied_key = headers.get(
-            "x-api-key",
-            "",
+        supplied_key = (
+            headers.get(
+                "x-api-key",
+                "",
+            )
         )
 
         path = scope.get(
@@ -1291,38 +2182,66 @@ class APIKeyMiddleware:
         ).upper()
 
         # =================================================
-        # VIDEO ENDPOINT FOR N8N
+        # PRIVATE VIDEO ENDPOINT FOR N8N/YOUTUBE
         #
-        # GET /video/5
+        # GET /video/14
+        # x-api-key: ...
         # =================================================
 
-        if path.startswith("/video/"):
+        if path.startswith(
+            "/video/"
+        ):
+
+            if method not in {
+                "GET",
+                "HEAD",
+            }:
+
+                await self.send_json(
+                    send,
+                    405,
+                    {
+                        "error":
+                            "Method not allowed",
+                    },
+                )
+
+                return
 
             if not hmac.compare_digest(
                 supplied_key,
                 VIDEO_DOWNLOAD_API_KEY,
             ):
+
                 await self.send_json(
                     send,
                     401,
                     {
-                        "error": "Unauthorized",
+                        "error":
+                            "Unauthorized",
                     },
                 )
+
                 return
 
             short_id_text = path[
                 len("/video/"):
             ].strip("/")
 
-            if not short_id_text.isdigit():
+            if (
+                not short_id_text
+                .isdigit()
+            ):
+
                 await self.send_json(
                     send,
                     400,
                     {
-                        "error": "Invalid short_id",
+                        "error":
+                            "Invalid short_id",
                     },
                 )
+
                 return
 
             short_id = int(
@@ -1330,160 +2249,327 @@ class APIKeyMiddleware:
             )
 
             file_path = Path(
-                f"/videos/short_{short_id}.mp4"
+                f"/videos/"
+                f"short_{short_id}.mp4"
             )
 
             if not file_path.is_file():
+
                 await self.send_json(
                     send,
                     404,
                     {
-                        "error": "Video not found",
+                        "error":
+                            "Video not found",
                     },
                 )
+
                 return
 
-            file_size = file_path.stat().st_size
-
-            await send({
-                "type": "http.response.start",
-                "status": 200,
-                "headers": [
-                    (
-                        b"content-type",
-                        b"video/mp4",
-                    ),
-                    (
-                        b"content-length",
-                        str(file_size).encode(),
-                    ),
-                    (
-                        b"content-disposition",
-                        (
-                            f'attachment; '
-                            f'filename="short_{short_id}.mp4"'
-                        ).encode(),
-                    ),
-                ],
-            })
-
-            with open(
+            await self.stream_video(
+                send,
                 file_path,
-                "rb",
-            ) as video_file:
-
-                while True:
-                    chunk = video_file.read(
-                        1024 * 1024
-                    )
-
-                    if not chunk:
-                        break
-
-                    await send({
-                        "type": "http.response.body",
-                        "body": chunk,
-                        "more_body": True,
-                    })
-
-            await send({
-                "type": "http.response.body",
-                "body": b"",
-                "more_body": False,
-            })
+                short_id,
+                method,
+                attachment=True,
+            )
 
             return
 
         # =================================================
-        # YOUTUBE RESULT CALLBACK FROM N8N
+        # TEMPORARY SIGNED VIDEO URL FOR INSTAGRAM / META
         #
-        # POST /youtube-callback/5
+        # GET /instagram-video/14
+        # ?expires=...
+        # &signature=...
         #
-        # Header:
-        # x-publish-key: ...
-        #
-        # Success body:
-        # {
-        #   "status": "published",
-        #   "youtube_video_id": "abc123"
-        # }
-        #
-        # Failed body:
-        # {
-        #   "status": "failed",
-        #   "error_message": "..."
-        # }
+        # No x-api-key required.
         # =================================================
 
-        if path.startswith("/youtube-callback/"):
+        if path.startswith(
+            "/instagram-video/"
+        ):
 
-            callback_key = headers.get(
-                N8N_YOUTUBE_WEBHOOK_HEADER.lower(),
-                "",
-            )
+            if method not in {
+                "GET",
+                "HEAD",
+            }:
 
-            if not hmac.compare_digest(
-                callback_key,
-                N8N_YOUTUBE_WEBHOOK_KEY,
-            ):
-                await self.send_json(
-                    send,
-                    401,
-                    {
-                        "error": "Unauthorized",
-                    },
-                )
-                return
-
-            if method != "POST":
                 await self.send_json(
                     send,
                     405,
                     {
-                        "error": "Method not allowed",
+                        "error":
+                            "Method not allowed",
                     },
                 )
+
                 return
 
             short_id_text = path[
-                len("/youtube-callback/"):
+                len(
+                    "/instagram-video/"
+                ):
             ].strip("/")
 
-            if not short_id_text.isdigit():
+            if (
+                not short_id_text
+                .isdigit()
+            ):
+
                 await self.send_json(
                     send,
                     400,
                     {
-                        "error": "Invalid short_id",
+                        "error":
+                            "Invalid short_id",
                     },
                 )
+
                 return
 
             short_id = int(
                 short_id_text
             )
 
-            raw_body = await self.read_body(
-                receive
+            query_string = (
+                scope.get(
+                    "query_string",
+                    b"",
+                )
+                .decode(
+                    "utf-8",
+                    errors="replace",
+                )
             )
 
-            try:
-                payload = json.loads(
-                    raw_body.decode("utf-8")
+            query = (
+                urllib.parse.parse_qs(
+                    query_string
+                )
+            )
+
+            expires_text = (
+                query.get(
+                    "expires",
+                    [""],
+                )[0]
+            )
+
+            supplied_signature = (
+                query.get(
+                    "signature",
+                    [""],
+                )[0]
+            )
+
+            if (
+                not expires_text
+                .isdigit()
+            ):
+
+                await self.send_json(
+                    send,
+                    401,
+                    {
+                        "error":
+                            "Invalid or missing expiry",
+                    },
                 )
 
-            except Exception:
+                return
+
+            expires = int(
+                expires_text
+            )
+
+            if (
+                int(time.time())
+                > expires
+            ):
+
+                await self.send_json(
+                    send,
+                    401,
+                    {
+                        "error":
+                            "Video URL expired",
+                    },
+                )
+
+                return
+
+            if (
+                not
+                N8N_INSTAGRAM_WEBHOOK_KEY
+            ):
+
+                await self.send_json(
+                    send,
+                    500,
+                    {
+                        "error":
+                            "Instagram signing "
+                            "key is not configured",
+                    },
+                )
+
+                return
+
+            expected_signature = (
+                create_instagram_video_signature(
+                    short_id,
+                    expires,
+                )
+            )
+
+            if not hmac.compare_digest(
+                supplied_signature,
+                expected_signature,
+            ):
+
+                await self.send_json(
+                    send,
+                    401,
+                    {
+                        "error":
+                            "Invalid signature",
+                    },
+                )
+
+                return
+
+            file_path = Path(
+                f"/videos/"
+                f"short_{short_id}.mp4"
+            )
+
+            if not file_path.is_file():
+
+                await self.send_json(
+                    send,
+                    404,
+                    {
+                        "error":
+                            "Video not found",
+                    },
+                )
+
+                return
+
+            await self.stream_video(
+                send,
+                file_path,
+                short_id,
+                method,
+                attachment=False,
+            )
+
+            return
+
+        # =================================================
+        # YOUTUBE CALLBACK
+        # =================================================
+
+        if path.startswith(
+            "/youtube-callback/"
+        ):
+
+            callback_key = (
+                headers.get(
+                    N8N_YOUTUBE_WEBHOOK_HEADER
+                    .lower(),
+                    "",
+                )
+            )
+
+            if not hmac.compare_digest(
+                callback_key,
+                N8N_YOUTUBE_WEBHOOK_KEY,
+            ):
+
+                await self.send_json(
+                    send,
+                    401,
+                    {
+                        "error":
+                            "Unauthorized",
+                    },
+                )
+
+                return
+
+            if method != "POST":
+
+                await self.send_json(
+                    send,
+                    405,
+                    {
+                        "error":
+                            "Method not allowed",
+                    },
+                )
+
+                return
+
+            short_id_text = path[
+                len(
+                    "/youtube-callback/"
+                ):
+            ].strip("/")
+
+            if (
+                not short_id_text
+                .isdigit()
+            ):
+
                 await self.send_json(
                     send,
                     400,
                     {
-                        "error": "Invalid JSON",
+                        "error":
+                            "Invalid short_id",
                     },
                 )
+
+                return
+
+            short_id = int(
+                short_id_text
+            )
+
+            raw_body = (
+                await self.read_body(
+                    receive
+                )
+            )
+
+            try:
+
+                payload = json.loads(
+                    raw_body.decode(
+                        "utf-8"
+                    )
+                )
+
+            except Exception:
+
+                await self.send_json(
+                    send,
+                    400,
+                    {
+                        "error":
+                            "Invalid JSON",
+                    },
+                )
+
                 return
 
             youtube_status = str(
-                payload.get("status", "")
+                payload.get(
+                    "status",
+                    "",
+                )
             ).strip()
 
             youtube_video_id = str(
@@ -1504,32 +2590,40 @@ class APIKeyMiddleware:
                 "published",
                 "failed",
             }:
+
                 await self.send_json(
                     send,
                     400,
                     {
                         "error": (
                             "status must be "
-                            "'published' or 'failed'"
+                            "'published' or "
+                            "'failed'"
                         ),
                     },
                 )
+
                 return
 
             if (
-                youtube_status == "published"
-                and not youtube_video_id
+                youtube_status
+                == "published"
+                and not
+                youtube_video_id
             ):
+
                 await self.send_json(
                     send,
                     400,
                     {
                         "error": (
                             "youtube_video_id "
-                            "is required for published status"
+                            "is required for "
+                            "published status"
                         ),
                     },
                 )
+
                 return
 
             conn = get_db()
@@ -1537,7 +2631,10 @@ class APIKeyMiddleware:
 
             try:
 
-                if youtube_status == "published":
+                if (
+                    youtube_status
+                    == "published"
+                ):
 
                     cur.execute(
                         """
@@ -1569,28 +2666,36 @@ class APIKeyMiddleware:
                         RETURNING id
                         """,
                         (
-                            error_message[:2000],
+                            error_message[
+                                :2000
+                            ],
                             short_id,
                         ),
                     )
 
-                updated = cur.fetchone()
+                updated = (
+                    cur.fetchone()
+                )
 
                 if not updated:
+
                     conn.rollback()
 
                     await self.send_json(
                         send,
                         404,
                         {
-                            "error": "Short not found",
+                            "error":
+                                "Short not found",
                         },
                     )
+
                     return
 
                 conn.commit()
 
             except Exception:
+
                 conn.rollback()
                 raise
 
@@ -1603,10 +2708,310 @@ class APIKeyMiddleware:
                 200,
                 {
                     "success": True,
-                    "short_id": short_id,
-                    "youtube_status": youtube_status,
+                    "short_id":
+                        short_id,
+                    "youtube_status":
+                        youtube_status,
                     "youtube_video_id":
-                        youtube_video_id or None,
+                        (
+                            youtube_video_id
+                            or None
+                        ),
+                },
+            )
+
+            return
+
+        # =================================================
+        # INSTAGRAM CALLBACK FROM N8N
+        #
+        # POST /instagram-callback/14
+        #
+        # Header:
+        # x-instagram-publish-key: ...
+        #
+        # Success body:
+        # {
+        #   "status": "published",
+        #   "instagram_media_id": "..."
+        # }
+        #
+        # Failed:
+        # {
+        #   "status": "failed",
+        #   "error_message": "..."
+        # }
+        # =================================================
+
+        if path.startswith(
+            "/instagram-callback/"
+        ):
+
+            if (
+                not
+                N8N_INSTAGRAM_WEBHOOK_KEY
+            ):
+
+                await self.send_json(
+                    send,
+                    500,
+                    {
+                        "error":
+                            "Instagram webhook "
+                            "key is not configured",
+                    },
+                )
+
+                return
+
+            callback_key = (
+                headers.get(
+                    N8N_INSTAGRAM_WEBHOOK_HEADER
+                    .lower(),
+                    "",
+                )
+            )
+
+            if not hmac.compare_digest(
+                callback_key,
+                N8N_INSTAGRAM_WEBHOOK_KEY,
+            ):
+
+                await self.send_json(
+                    send,
+                    401,
+                    {
+                        "error":
+                            "Unauthorized",
+                    },
+                )
+
+                return
+
+            if method != "POST":
+
+                await self.send_json(
+                    send,
+                    405,
+                    {
+                        "error":
+                            "Method not allowed",
+                    },
+                )
+
+                return
+
+            short_id_text = path[
+                len(
+                    "/instagram-callback/"
+                ):
+            ].strip("/")
+
+            if (
+                not short_id_text
+                .isdigit()
+            ):
+
+                await self.send_json(
+                    send,
+                    400,
+                    {
+                        "error":
+                            "Invalid short_id",
+                    },
+                )
+
+                return
+
+            short_id = int(
+                short_id_text
+            )
+
+            raw_body = (
+                await self.read_body(
+                    receive
+                )
+            )
+
+            try:
+
+                payload = json.loads(
+                    raw_body.decode(
+                        "utf-8"
+                    )
+                )
+
+            except Exception:
+
+                await self.send_json(
+                    send,
+                    400,
+                    {
+                        "error":
+                            "Invalid JSON",
+                    },
+                )
+
+                return
+
+            instagram_status = str(
+                payload.get(
+                    "status",
+                    "",
+                )
+            ).strip()
+
+            instagram_media_id = str(
+                payload.get(
+                    "instagram_media_id",
+                    "",
+                )
+            ).strip()
+
+            error_message = str(
+                payload.get(
+                    "error_message",
+                    "",
+                )
+            ).strip()
+
+            if instagram_status not in {
+                "published",
+                "failed",
+            }:
+
+                await self.send_json(
+                    send,
+                    400,
+                    {
+                        "error": (
+                            "status must be "
+                            "'published' or "
+                            "'failed'"
+                        ),
+                    },
+                )
+
+                return
+
+            if (
+                instagram_status
+                == "published"
+                and not
+                instagram_media_id
+            ):
+
+                await self.send_json(
+                    send,
+                    400,
+                    {
+                        "error": (
+                            "instagram_media_id "
+                            "is required for "
+                            "published status"
+                        ),
+                    },
+                )
+
+                return
+
+            conn = get_db()
+            cur = conn.cursor()
+
+            try:
+
+                if (
+                    instagram_status
+                    == "published"
+                ):
+
+                    cur.execute(
+                        """
+                        UPDATE shorts
+                        SET
+                            instagram_status = 'published',
+                            instagram_media_id = %s,
+                            instagram_last_error = NULL,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        RETURNING id
+                        """,
+                        (
+                            instagram_media_id,
+                            short_id,
+                        ),
+                    )
+
+                else:
+
+                    if not error_message:
+                        error_message = (
+                            "Instagram publication "
+                            "failed in n8n"
+                        )
+
+                    cur.execute(
+                        """
+                        UPDATE shorts
+                        SET
+                            instagram_status = 'failed',
+                            instagram_last_error = %s,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        RETURNING id
+                        """,
+                        (
+                            error_message[
+                                :2000
+                            ],
+                            short_id,
+                        ),
+                    )
+
+                updated = (
+                    cur.fetchone()
+                )
+
+                if not updated:
+
+                    conn.rollback()
+
+                    await self.send_json(
+                        send,
+                        404,
+                        {
+                            "error":
+                                "Short not found",
+                        },
+                    )
+
+                    return
+
+                conn.commit()
+
+            except Exception:
+
+                conn.rollback()
+                raise
+
+            finally:
+                cur.close()
+                conn.close()
+
+            await self.send_json(
+                send,
+                200,
+                {
+                    "success": True,
+                    "short_id":
+                        short_id,
+                    "instagram_status":
+                        instagram_status,
+                    "instagram_media_id":
+                        (
+                            instagram_media_id
+                            or None
+                        ),
                 },
             )
 
@@ -1620,13 +3025,16 @@ class APIKeyMiddleware:
             supplied_key,
             MCP_API_KEY,
         ):
+
             await self.send_json(
                 send,
                 401,
                 {
-                    "error": "Unauthorized",
+                    "error":
+                        "Unauthorized",
                 },
             )
+
             return
 
         await self.app(
@@ -1656,7 +3064,9 @@ if __name__ == "__main__":
         flush=True,
     )
 
-    registered_tools = mcp._tool_manager.list_tools()
+    registered_tools = (
+        mcp._tool_manager.list_tools()
+    )
 
     print(
         "REGISTERED MCP TOOLS:",
@@ -1664,15 +3074,18 @@ if __name__ == "__main__":
     )
 
     for tool in registered_tools:
+
         print(
             f"- {tool.name}",
             flush=True,
         )
 
-    mcp_app = mcp.streamable_http_app()
+    mcp_app = (
+        mcp.streamable_http_app()
+    )
 
     app = APIKeyMiddleware(
-        mcp_app,
+        mcp_app
     )
 
     uvicorn.run(
