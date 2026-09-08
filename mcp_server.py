@@ -2343,7 +2343,6 @@ def publish_to_instagram(
 # =========================================================
 
 class APIKeyMiddleware:
-
     def __init__(
         self,
         app,
@@ -2356,17 +2355,14 @@ class APIKeyMiddleware:
         status_code: int,
         payload: dict,
     ):
-
         body = json.dumps(
             payload,
             ensure_ascii=False,
         ).encode("utf-8")
 
         await send({
-            "type":
-                "http.response.start",
-            "status":
-                status_code,
+            "type": "http.response.start",
+            "status": status_code,
             "headers": [
                 (
                     b"content-type",
@@ -2374,37 +2370,26 @@ class APIKeyMiddleware:
                 ),
                 (
                     b"content-length",
-                    str(
-                        len(body)
-                    ).encode(),
+                    str(len(body)).encode(),
                 ),
             ],
         })
 
         await send({
-            "type":
-                "http.response.body",
-            "body":
-                body,
+            "type": "http.response.body",
+            "body": body,
         })
 
     async def read_body(
         self,
         receive,
     ) -> bytes:
-
         chunks = []
 
         while True:
+            message = await receive()
 
-            message = (
-                await receive()
-            )
-
-            if (
-                message["type"]
-                != "http.request"
-            ):
+            if message["type"] != "http.request":
                 continue
 
             body = message.get(
@@ -2413,9 +2398,7 @@ class APIKeyMiddleware:
             )
 
             if body:
-                chunks.append(
-                    body
-                )
+                chunks.append(body)
 
             if not message.get(
                 "more_body",
@@ -2423,9 +2406,7 @@ class APIKeyMiddleware:
             ):
                 break
 
-        return b"".join(
-            chunks
-        )
+        return b"".join(chunks)
 
     async def stream_video(
         self,
@@ -2435,7 +2416,6 @@ class APIKeyMiddleware:
         method: str,
         attachment: bool = False,
     ):
-
         file_size = (
             file_path.stat().st_size
         )
@@ -2447,10 +2427,8 @@ class APIKeyMiddleware:
         )
 
         await send({
-            "type":
-                "http.response.start",
-            "status":
-                200,
+            "type": "http.response.start",
+            "status": 200,
             "headers": [
                 (
                     b"content-type",
@@ -2458,16 +2436,13 @@ class APIKeyMiddleware:
                 ),
                 (
                     b"content-length",
-                    str(
-                        file_size
-                    ).encode(),
+                    str(file_size).encode(),
                 ),
                 (
                     b"content-disposition",
                     (
                         f'{disposition_type}; '
-                        f'filename="short_'
-                        f'{short_id}.mp4"'
+                        f'filename="short_{short_id}.mp4"'
                     ).encode(),
                 ),
                 (
@@ -2478,25 +2453,18 @@ class APIKeyMiddleware:
         })
 
         if method == "HEAD":
-
             await send({
-                "type":
-                    "http.response.body",
-                "body":
-                    b"",
-                "more_body":
-                    False,
+                "type": "http.response.body",
+                "body": b"",
+                "more_body": False,
             })
-
             return
 
         with open(
             file_path,
             "rb",
         ) as video_file:
-
             while True:
-
                 chunk = video_file.read(
                     1024 * 1024
                 )
@@ -2505,21 +2473,15 @@ class APIKeyMiddleware:
                     break
 
                 await send({
-                    "type":
-                        "http.response.body",
-                    "body":
-                        chunk,
-                    "more_body":
-                        True,
+                    "type": "http.response.body",
+                    "body": chunk,
+                    "more_body": True,
                 })
 
         await send({
-            "type":
-                "http.response.body",
-            "body":
-                b"",
-            "more_body":
-                False,
+            "type": "http.response.body",
+            "body": b"",
+            "more_body": False,
         })
 
     async def __call__(
@@ -2528,24 +2490,17 @@ class APIKeyMiddleware:
         receive,
         send,
     ):
-
         if scope["type"] != "http":
-
             await self.app(
                 scope,
                 receive,
                 send,
             )
-
             return
 
         headers = {
-            key.decode(
-                "latin-1"
-            ).lower():
-                value.decode(
-                    "latin-1"
-                )
+            key.decode("latin-1").lower():
+                value.decode("latin-1")
             for key, value
             in scope.get(
                 "headers",
@@ -2553,11 +2508,9 @@ class APIKeyMiddleware:
             )
         }
 
-        supplied_key = (
-            headers.get(
-                "x-api-key",
-                "",
-            )
+        supplied_key = headers.get(
+            "x-api-key",
+            "",
         )
 
         path = scope.get(
@@ -2571,21 +2524,17 @@ class APIKeyMiddleware:
         ).upper()
 
         # =================================================
-        # PRIVATE VIDEO ENDPOINT FOR N8N/YOUTUBE
+        # PRIVATE VIDEO ENDPOINT FOR N8N / YOUTUBE
         #
         # GET /video/14
-        # x-api-key: ...
+        # x-api-key: VIDEO_DOWNLOAD_API_KEY
         # =================================================
 
-        if path.startswith(
-            "/video/"
-        ):
-
+        if path.startswith("/video/"):
             if method not in {
                 "GET",
                 "HEAD",
             }:
-
                 await self.send_json(
                     send,
                     405,
@@ -2594,14 +2543,12 @@ class APIKeyMiddleware:
                             "Method not allowed",
                     },
                 )
-
                 return
 
             if not hmac.compare_digest(
                 supplied_key,
                 VIDEO_DOWNLOAD_API_KEY,
             ):
-
                 await self.send_json(
                     send,
                     401,
@@ -2610,18 +2557,13 @@ class APIKeyMiddleware:
                             "Unauthorized",
                     },
                 )
-
                 return
 
             short_id_text = path[
                 len("/video/"):
             ].strip("/")
 
-            if (
-                not short_id_text
-                .isdigit()
-            ):
-
+            if not short_id_text.isdigit():
                 await self.send_json(
                     send,
                     400,
@@ -2630,7 +2572,6 @@ class APIKeyMiddleware:
                             "Invalid short_id",
                     },
                 )
-
                 return
 
             short_id = int(
@@ -2638,12 +2579,10 @@ class APIKeyMiddleware:
             )
 
             file_path = Path(
-                f"/videos/"
-                f"short_{short_id}.mp4"
+                f"/videos/short_{short_id}.mp4"
             )
 
             if not file_path.is_file():
-
                 await self.send_json(
                     send,
                     404,
@@ -2652,7 +2591,6 @@ class APIKeyMiddleware:
                             "Video not found",
                     },
                 )
-
                 return
 
             await self.stream_video(
@@ -2662,7 +2600,6 @@ class APIKeyMiddleware:
                 method,
                 attachment=True,
             )
-
             return
 
         # =================================================
@@ -2672,18 +2609,16 @@ class APIKeyMiddleware:
         # ?expires=...
         # &signature=...
         #
-        # No x-api-key required.
+        # No x-api-key required
         # =================================================
 
         if path.startswith(
             "/instagram-video/"
         ):
-
             if method not in {
                 "GET",
                 "HEAD",
             }:
-
                 await self.send_json(
                     send,
                     405,
@@ -2692,7 +2627,6 @@ class APIKeyMiddleware:
                             "Method not allowed",
                     },
                 )
-
                 return
 
             short_id_text = path[
@@ -2701,11 +2635,7 @@ class APIKeyMiddleware:
                 ):
             ].strip("/")
 
-            if (
-                not short_id_text
-                .isdigit()
-            ):
-
+            if not short_id_text.isdigit():
                 await self.send_json(
                     send,
                     400,
@@ -2714,7 +2644,6 @@ class APIKeyMiddleware:
                             "Invalid short_id",
                     },
                 )
-
                 return
 
             short_id = int(
@@ -2738,25 +2667,17 @@ class APIKeyMiddleware:
                 )
             )
 
-            expires_text = (
-                query.get(
-                    "expires",
-                    [""],
-                )[0]
-            )
+            expires_text = query.get(
+                "expires",
+                [""],
+            )[0]
 
-            supplied_signature = (
-                query.get(
-                    "signature",
-                    [""],
-                )[0]
-            )
+            supplied_signature = query.get(
+                "signature",
+                [""],
+            )[0]
 
-            if (
-                not expires_text
-                .isdigit()
-            ):
-
+            if not expires_text.isdigit():
                 await self.send_json(
                     send,
                     401,
@@ -2765,18 +2686,13 @@ class APIKeyMiddleware:
                             "Invalid or missing expiry",
                     },
                 )
-
                 return
 
             expires = int(
                 expires_text
             )
 
-            if (
-                int(time.time())
-                > expires
-            ):
-
+            if int(time.time()) > expires:
                 await self.send_json(
                     send,
                     401,
@@ -2785,14 +2701,9 @@ class APIKeyMiddleware:
                             "Video URL expired",
                     },
                 )
-
                 return
 
-            if (
-                not
-                N8N_INSTAGRAM_WEBHOOK_KEY
-            ):
-
+            if not N8N_INSTAGRAM_WEBHOOK_KEY:
                 await self.send_json(
                     send,
                     500,
@@ -2802,7 +2713,6 @@ class APIKeyMiddleware:
                             "key is not configured",
                     },
                 )
-
                 return
 
             expected_signature = (
@@ -2816,7 +2726,6 @@ class APIKeyMiddleware:
                 supplied_signature,
                 expected_signature,
             ):
-
                 await self.send_json(
                     send,
                     401,
@@ -2825,16 +2734,13 @@ class APIKeyMiddleware:
                             "Invalid signature",
                     },
                 )
-
                 return
 
             file_path = Path(
-                f"/videos/"
-                f"short_{short_id}.mp4"
+                f"/videos/short_{short_id}.mp4"
             )
 
             if not file_path.is_file():
-
                 await self.send_json(
                     send,
                     404,
@@ -2843,7 +2749,6 @@ class APIKeyMiddleware:
                             "Video not found",
                     },
                 )
-
                 return
 
             await self.stream_video(
@@ -2853,7 +2758,6 @@ class APIKeyMiddleware:
                 method,
                 attachment=False,
             )
-
             return
 
         # =================================================
@@ -2863,20 +2767,15 @@ class APIKeyMiddleware:
         if path.startswith(
             "/youtube-callback/"
         ):
-
-            callback_key = (
-                headers.get(
-                    N8N_YOUTUBE_WEBHOOK_HEADER
-                    .lower(),
-                    "",
-                )
+            callback_key = headers.get(
+                N8N_YOUTUBE_WEBHOOK_HEADER.lower(),
+                "",
             )
 
             if not hmac.compare_digest(
                 callback_key,
                 N8N_YOUTUBE_WEBHOOK_KEY,
             ):
-
                 await self.send_json(
                     send,
                     401,
@@ -2885,11 +2784,9 @@ class APIKeyMiddleware:
                             "Unauthorized",
                     },
                 )
-
                 return
 
             if method != "POST":
-
                 await self.send_json(
                     send,
                     405,
@@ -2898,7 +2795,6 @@ class APIKeyMiddleware:
                             "Method not allowed",
                     },
                 )
-
                 return
 
             short_id_text = path[
@@ -2907,11 +2803,7 @@ class APIKeyMiddleware:
                 ):
             ].strip("/")
 
-            if (
-                not short_id_text
-                .isdigit()
-            ):
-
+            if not short_id_text.isdigit():
                 await self.send_json(
                     send,
                     400,
@@ -2920,29 +2812,23 @@ class APIKeyMiddleware:
                             "Invalid short_id",
                     },
                 )
-
                 return
 
             short_id = int(
                 short_id_text
             )
 
-            raw_body = (
-                await self.read_body(
-                    receive
-                )
+            raw_body = await self.read_body(
+                receive
             )
 
             try:
-
                 payload = json.loads(
                     raw_body.decode(
                         "utf-8"
                     )
                 )
-
             except Exception:
-
                 await self.send_json(
                     send,
                     400,
@@ -2951,7 +2837,6 @@ class APIKeyMiddleware:
                             "Invalid JSON",
                     },
                 )
-
                 return
 
             youtube_status = str(
@@ -2979,7 +2864,6 @@ class APIKeyMiddleware:
                 "published",
                 "failed",
             }:
-
                 await self.send_json(
                     send,
                     400,
@@ -2991,16 +2875,12 @@ class APIKeyMiddleware:
                         ),
                     },
                 )
-
                 return
 
             if (
-                youtube_status
-                == "published"
-                and not
-                youtube_video_id
+                youtube_status == "published"
+                and not youtube_video_id
             ):
-
                 await self.send_json(
                     send,
                     400,
@@ -3012,19 +2892,13 @@ class APIKeyMiddleware:
                         ),
                     },
                 )
-
                 return
 
             conn = get_db()
             cur = conn.cursor()
 
             try:
-
-                if (
-                    youtube_status
-                    == "published"
-                ):
-
+                if youtube_status == "published":
                     cur.execute(
                         """
                         UPDATE shorts
@@ -3041,8 +2915,12 @@ class APIKeyMiddleware:
                             short_id,
                         ),
                     )
-
                 else:
+                    if not error_message:
+                        error_message = (
+                            "YouTube publication "
+                            "failed in n8n"
+                        )
 
                     cur.execute(
                         """
@@ -3055,19 +2933,14 @@ class APIKeyMiddleware:
                         RETURNING id
                         """,
                         (
-                            error_message[
-                                :2000
-                            ],
+                            error_message[:2000],
                             short_id,
                         ),
                     )
 
-                updated = (
-                    cur.fetchone()
-                )
+                updated = cur.fetchone()
 
                 if not updated:
-
                     conn.rollback()
 
                     await self.send_json(
@@ -3078,13 +2951,11 @@ class APIKeyMiddleware:
                                 "Short not found",
                         },
                     )
-
                     return
 
                 conn.commit()
 
             except Exception:
-
                 conn.rollback()
                 raise
 
@@ -3108,39 +2979,16 @@ class APIKeyMiddleware:
                         ),
                 },
             )
-
             return
 
         # =================================================
-        # INSTAGRAM CALLBACK FROM N8N
-        #
-        # POST /instagram-callback/14
-        #
-        # Header:
-        # x-instagram-publish-key: ...
-        #
-        # Success body:
-        # {
-        #   "status": "published",
-        #   "instagram_media_id": "..."
-        # }
-        #
-        # Failed:
-        # {
-        #   "status": "failed",
-        #   "error_message": "..."
-        # }
+        # INSTAGRAM CALLBACK
         # =================================================
 
         if path.startswith(
             "/instagram-callback/"
         ):
-
-            if (
-                not
-                N8N_INSTAGRAM_WEBHOOK_KEY
-            ):
-
+            if not N8N_INSTAGRAM_WEBHOOK_KEY:
                 await self.send_json(
                     send,
                     500,
@@ -3150,22 +2998,17 @@ class APIKeyMiddleware:
                             "key is not configured",
                     },
                 )
-
                 return
 
-            callback_key = (
-                headers.get(
-                    N8N_INSTAGRAM_WEBHOOK_HEADER
-                    .lower(),
-                    "",
-                )
+            callback_key = headers.get(
+                N8N_INSTAGRAM_WEBHOOK_HEADER.lower(),
+                "",
             )
 
             if not hmac.compare_digest(
                 callback_key,
                 N8N_INSTAGRAM_WEBHOOK_KEY,
             ):
-
                 await self.send_json(
                     send,
                     401,
@@ -3174,11 +3017,9 @@ class APIKeyMiddleware:
                             "Unauthorized",
                     },
                 )
-
                 return
 
             if method != "POST":
-
                 await self.send_json(
                     send,
                     405,
@@ -3187,7 +3028,6 @@ class APIKeyMiddleware:
                             "Method not allowed",
                     },
                 )
-
                 return
 
             short_id_text = path[
@@ -3196,11 +3036,7 @@ class APIKeyMiddleware:
                 ):
             ].strip("/")
 
-            if (
-                not short_id_text
-                .isdigit()
-            ):
-
+            if not short_id_text.isdigit():
                 await self.send_json(
                     send,
                     400,
@@ -3209,29 +3045,23 @@ class APIKeyMiddleware:
                             "Invalid short_id",
                     },
                 )
-
                 return
 
             short_id = int(
                 short_id_text
             )
 
-            raw_body = (
-                await self.read_body(
-                    receive
-                )
+            raw_body = await self.read_body(
+                receive
             )
 
             try:
-
                 payload = json.loads(
                     raw_body.decode(
                         "utf-8"
                     )
                 )
-
             except Exception:
-
                 await self.send_json(
                     send,
                     400,
@@ -3240,7 +3070,6 @@ class APIKeyMiddleware:
                             "Invalid JSON",
                     },
                 )
-
                 return
 
             instagram_status = str(
@@ -3268,7 +3097,6 @@ class APIKeyMiddleware:
                 "published",
                 "failed",
             }:
-
                 await self.send_json(
                     send,
                     400,
@@ -3280,16 +3108,12 @@ class APIKeyMiddleware:
                         ),
                     },
                 )
-
                 return
 
             if (
-                instagram_status
-                == "published"
-                and not
-                instagram_media_id
+                instagram_status == "published"
+                and not instagram_media_id
             ):
-
                 await self.send_json(
                     send,
                     400,
@@ -3301,19 +3125,13 @@ class APIKeyMiddleware:
                         ),
                     },
                 )
-
                 return
 
             conn = get_db()
             cur = conn.cursor()
 
             try:
-
-                if (
-                    instagram_status
-                    == "published"
-                ):
-
+                if instagram_status == "published":
                     cur.execute(
                         """
                         UPDATE shorts
@@ -3330,9 +3148,7 @@ class APIKeyMiddleware:
                             short_id,
                         ),
                     )
-
                 else:
-
                     if not error_message:
                         error_message = (
                             "Instagram publication "
@@ -3350,19 +3166,14 @@ class APIKeyMiddleware:
                         RETURNING id
                         """,
                         (
-                            error_message[
-                                :2000
-                            ],
+                            error_message[:2000],
                             short_id,
                         ),
                     )
 
-                updated = (
-                    cur.fetchone()
-                )
+                updated = cur.fetchone()
 
                 if not updated:
-
                     conn.rollback()
 
                     await self.send_json(
@@ -3373,13 +3184,11 @@ class APIKeyMiddleware:
                                 "Short not found",
                         },
                     )
-
                     return
 
                 conn.commit()
 
             except Exception:
-
                 conn.rollback()
                 raise
 
@@ -3403,9 +3212,724 @@ class APIKeyMiddleware:
                         ),
                 },
             )
-
             return
-        
+
+        # =================================================
+        # SCHEDULER: GET DUE PUBLICATIONS
+        #
+        # GET /scheduled-publications
+        #
+        # Header:
+        # x-api-key: MCP_API_KEY
+        # =================================================
+
+        if path == "/scheduled-publications":
+            if not hmac.compare_digest(
+                supplied_key,
+                MCP_API_KEY,
+            ):
+                await self.send_json(
+                    send,
+                    401,
+                    {
+                        "error":
+                            "Unauthorized",
+                    },
+                )
+                return
+
+            if method != "GET":
+                await self.send_json(
+                    send,
+                    405,
+                    {
+                        "error":
+                            "Method not allowed",
+                    },
+                )
+                return
+
+            conn = get_db()
+            cur = conn.cursor()
+
+            try:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM (
+                        SELECT
+                            id,
+                            topic,
+                            'youtube' AS platform,
+                            youtube_publish_at AS publish_at
+                        FROM shorts
+                        WHERE status = 'completed'
+                          AND youtube_status = 'scheduled'
+                          AND youtube_publish_at IS NOT NULL
+                          AND youtube_publish_at <= NOW()
+
+                        UNION ALL
+
+                        SELECT
+                            id,
+                            topic,
+                            'instagram' AS platform,
+                            instagram_publish_at AS publish_at
+                        FROM shorts
+                        WHERE status = 'completed'
+                          AND instagram_status = 'scheduled'
+                          AND instagram_publish_at IS NOT NULL
+                          AND instagram_publish_at <= NOW()
+                    ) AS due
+                    ORDER BY publish_at ASC
+                    LIMIT 30
+                    """
+                )
+
+                rows = cur.fetchall()
+
+            finally:
+                cur.close()
+                conn.close()
+
+            publications = []
+
+            for row in rows:
+                publications.append({
+                    "short_id": row[0],
+                    "topic": row[1],
+                    "platform": row[2],
+                    "publish_at": (
+                        row[3].isoformat()
+                        if row[3]
+                        else None
+                    ),
+                })
+
+            await self.send_json(
+                send,
+                200,
+                {
+                    "count":
+                        len(publications),
+                    "publications":
+                        publications,
+                },
+            )
+            return
+
+        # =================================================
+        # SCHEDULER: RUN ONE PUBLICATION
+        #
+        # POST
+        # /run-scheduled-publication/{short_id}/{platform}
+        #
+        # Header:
+        # x-api-key: MCP_API_KEY
+        # =================================================
+
+        if path.startswith(
+            "/run-scheduled-publication/"
+        ):
+            if not hmac.compare_digest(
+                supplied_key,
+                MCP_API_KEY,
+            ):
+                await self.send_json(
+                    send,
+                    401,
+                    {
+                        "error":
+                            "Unauthorized",
+                    },
+                )
+                return
+
+            if method != "POST":
+                await self.send_json(
+                    send,
+                    405,
+                    {
+                        "error":
+                            "Method not allowed",
+                    },
+                )
+                return
+
+            remainder = path[
+                len(
+                    "/run-scheduled-publication/"
+                ):
+            ].strip("/")
+
+            parts = remainder.split("/")
+
+            if len(parts) != 2:
+                await self.send_json(
+                    send,
+                    400,
+                    {
+                        "error": (
+                            "Expected "
+                            "/run-scheduled-publication/"
+                            "{short_id}/{platform}"
+                        ),
+                    },
+                )
+                return
+
+            short_id_text = parts[0]
+
+            platform = (
+                parts[1]
+                .strip()
+                .lower()
+            )
+
+            if not short_id_text.isdigit():
+                await self.send_json(
+                    send,
+                    400,
+                    {
+                        "error":
+                            "Invalid short_id",
+                    },
+                )
+                return
+
+            if platform not in {
+                "youtube",
+                "instagram",
+            }:
+                await self.send_json(
+                    send,
+                    400,
+                    {
+                        "error": (
+                            "platform must be "
+                            "'youtube' or "
+                            "'instagram'"
+                        ),
+                    },
+                )
+                return
+
+            short_id = int(
+                short_id_text
+            )
+
+            file_path = Path(
+                f"/videos/short_{short_id}.mp4"
+            )
+
+            if not file_path.is_file():
+                await self.send_json(
+                    send,
+                    404,
+                    {
+                        "success": False,
+                        "error":
+                            "Video file not found",
+                        "short_id":
+                            short_id,
+                        "platform":
+                            platform,
+                    },
+                )
+                return
+
+            # ---------------------------------------------
+            # Atomically claim publication
+            # scheduled -> requested
+            # ---------------------------------------------
+
+            conn = get_db()
+            cur = conn.cursor()
+
+            try:
+                if platform == "youtube":
+                    cur.execute(
+                        """
+                        UPDATE shorts
+                        SET
+                            youtube_status = 'requested',
+                            youtube_last_error = NULL,
+                            updated_at = NOW()
+                        WHERE id = %s
+                          AND status = 'completed'
+                          AND youtube_status = 'scheduled'
+                          AND youtube_publish_at IS NOT NULL
+                          AND youtube_publish_at <= NOW()
+                        RETURNING
+                            id,
+                            youtube_title,
+                            youtube_description
+                        """,
+                        (short_id,),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE shorts
+                        SET
+                            instagram_status = 'requested',
+                            instagram_last_error = NULL,
+                            updated_at = NOW()
+                        WHERE id = %s
+                          AND status = 'completed'
+                          AND instagram_status = 'scheduled'
+                          AND instagram_publish_at IS NOT NULL
+                          AND instagram_publish_at <= NOW()
+                        RETURNING
+                            id,
+                            topic,
+                            youtube_title,
+                            youtube_description,
+                            instagram_caption
+                        """,
+                        (short_id,),
+                    )
+
+                row = cur.fetchone()
+
+                if not row:
+                    conn.rollback()
+
+                    await self.send_json(
+                        send,
+                        409,
+                        {
+                            "success": False,
+                            "error": (
+                                "Publication is not due, "
+                                "not scheduled, already "
+                                "requested or already "
+                                "published"
+                            ),
+                            "short_id":
+                                short_id,
+                            "platform":
+                                platform,
+                        },
+                    )
+                    return
+
+                conn.commit()
+
+            except Exception:
+                conn.rollback()
+                raise
+
+            finally:
+                cur.close()
+                conn.close()
+
+            # ---------------------------------------------
+            # Prepare YouTube payload
+            # ---------------------------------------------
+
+            if platform == "youtube":
+                youtube_title = row[1]
+                youtube_description = row[2]
+
+                if (
+                    not youtube_title
+                    or not youtube_description
+                ):
+                    error_message = (
+                        "YouTube title or "
+                        "description is empty"
+                    )
+
+                    conn = get_db()
+                    cur = conn.cursor()
+
+                    try:
+                        cur.execute(
+                            """
+                            UPDATE shorts
+                            SET
+                                youtube_status = 'failed',
+                                youtube_last_error = %s,
+                                updated_at = NOW()
+                            WHERE id = %s
+                            """,
+                            (
+                                error_message,
+                                short_id,
+                            ),
+                        )
+                        conn.commit()
+
+                    finally:
+                        cur.close()
+                        conn.close()
+
+                    await self.send_json(
+                        send,
+                        400,
+                        {
+                            "success": False,
+                            "error":
+                                error_message,
+                            "short_id":
+                                short_id,
+                        },
+                    )
+                    return
+
+                payload = {
+                    "short_id":
+                        short_id,
+                    "title":
+                        youtube_title,
+                    "description":
+                        youtube_description,
+                }
+
+                webhook_url = (
+                    N8N_YOUTUBE_WEBHOOK_URL
+                )
+
+                webhook_header = (
+                    N8N_YOUTUBE_WEBHOOK_HEADER
+                )
+
+                webhook_key = (
+                    N8N_YOUTUBE_WEBHOOK_KEY
+                )
+
+            # ---------------------------------------------
+            # Prepare Instagram payload
+            # ---------------------------------------------
+
+            else:
+                if (
+                    not N8N_INSTAGRAM_WEBHOOK_URL
+                    or not N8N_INSTAGRAM_WEBHOOK_KEY
+                ):
+                    error_message = (
+                        "Instagram n8n webhook "
+                        "is not configured"
+                    )
+
+                    conn = get_db()
+                    cur = conn.cursor()
+
+                    try:
+                        cur.execute(
+                            """
+                            UPDATE shorts
+                            SET
+                                instagram_status = 'failed',
+                                instagram_last_error = %s,
+                                updated_at = NOW()
+                            WHERE id = %s
+                            """,
+                            (
+                                error_message,
+                                short_id,
+                            ),
+                        )
+                        conn.commit()
+
+                    finally:
+                        cur.close()
+                        conn.close()
+
+                    await self.send_json(
+                        send,
+                        500,
+                        {
+                            "success": False,
+                            "error":
+                                error_message,
+                            "short_id":
+                                short_id,
+                        },
+                    )
+                    return
+
+                topic = row[1]
+                youtube_title = row[2]
+                youtube_description = row[3]
+                instagram_caption = row[4]
+
+                final_caption = (
+                    instagram_caption
+                    or youtube_description
+                    or youtube_title
+                    or topic
+                    or ""
+                ).strip()
+
+                if not final_caption:
+                    error_message = (
+                        "Instagram caption is empty"
+                    )
+
+                    conn = get_db()
+                    cur = conn.cursor()
+
+                    try:
+                        cur.execute(
+                            """
+                            UPDATE shorts
+                            SET
+                                instagram_status = 'failed',
+                                instagram_last_error = %s,
+                                updated_at = NOW()
+                            WHERE id = %s
+                            """,
+                            (
+                                error_message,
+                                short_id,
+                            ),
+                        )
+                        conn.commit()
+
+                    finally:
+                        cur.close()
+                        conn.close()
+
+                    await self.send_json(
+                        send,
+                        400,
+                        {
+                            "success": False,
+                            "error":
+                                error_message,
+                            "short_id":
+                                short_id,
+                        },
+                    )
+                    return
+
+                signed_video = (
+                    create_instagram_video_url(
+                        short_id
+                    )
+                )
+
+                payload = {
+                    "short_id":
+                        short_id,
+                    "caption":
+                        final_caption,
+                    "video_url":
+                        signed_video["url"],
+                }
+
+                webhook_url = (
+                    N8N_INSTAGRAM_WEBHOOK_URL
+                )
+
+                webhook_header = (
+                    N8N_INSTAGRAM_WEBHOOK_HEADER
+                )
+
+                webhook_key = (
+                    N8N_INSTAGRAM_WEBHOOK_KEY
+                )
+
+            # ---------------------------------------------
+            # Call existing n8n workflow
+            # ---------------------------------------------
+
+            body = json.dumps(
+                payload,
+                ensure_ascii=False,
+            ).encode("utf-8")
+
+            request = urllib.request.Request(
+                webhook_url,
+                data=body,
+                method="POST",
+                headers={
+                    "Content-Type":
+                        "application/json",
+                    webhook_header:
+                        webhook_key,
+                },
+            )
+
+            try:
+                with urllib.request.urlopen(
+                    request,
+                    timeout=30,
+                ) as response:
+                    response_status = (
+                        response.status
+                    )
+
+                    response_body = (
+                        response.read(
+                            1024 * 1024
+                        )
+                        .decode(
+                            "utf-8",
+                            errors="replace",
+                        )
+                    )
+
+            except urllib.error.HTTPError as exc:
+                error_body = (
+                    exc.read()
+                    .decode(
+                        "utf-8",
+                        errors="replace",
+                    )
+                )
+
+                error_message = (
+                    f"Scheduled n8n HTTP "
+                    f"{exc.code}: "
+                    f"{error_body}"
+                )[:2000]
+
+                conn = get_db()
+                cur = conn.cursor()
+
+                try:
+                    if platform == "youtube":
+                        cur.execute(
+                            """
+                            UPDATE shorts
+                            SET
+                                youtube_status = 'failed',
+                                youtube_last_error = %s,
+                                updated_at = NOW()
+                            WHERE id = %s
+                            """,
+                            (
+                                error_message,
+                                short_id,
+                            ),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            UPDATE shorts
+                            SET
+                                instagram_status = 'failed',
+                                instagram_last_error = %s,
+                                updated_at = NOW()
+                            WHERE id = %s
+                            """,
+                            (
+                                error_message,
+                                short_id,
+                            ),
+                        )
+
+                    conn.commit()
+
+                finally:
+                    cur.close()
+                    conn.close()
+
+                await self.send_json(
+                    send,
+                    502,
+                    {
+                        "success": False,
+                        "error": (
+                            f"n8n HTTP error "
+                            f"{exc.code}"
+                        ),
+                        "short_id":
+                            short_id,
+                        "platform":
+                            platform,
+                    },
+                )
+                return
+
+            except Exception as exc:
+                error_message = (
+                    f"Scheduled n8n call "
+                    f"failed: {exc}"
+                )[:2000]
+
+                conn = get_db()
+                cur = conn.cursor()
+
+                try:
+                    if platform == "youtube":
+                        cur.execute(
+                            """
+                            UPDATE shorts
+                            SET
+                                youtube_status = 'failed',
+                                youtube_last_error = %s,
+                                updated_at = NOW()
+                            WHERE id = %s
+                            """,
+                            (
+                                error_message,
+                                short_id,
+                            ),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            UPDATE shorts
+                            SET
+                                instagram_status = 'failed',
+                                instagram_last_error = %s,
+                                updated_at = NOW()
+                            WHERE id = %s
+                            """,
+                            (
+                                error_message,
+                                short_id,
+                            ),
+                        )
+
+                    conn.commit()
+
+                finally:
+                    cur.close()
+                    conn.close()
+
+                await self.send_json(
+                    send,
+                    502,
+                    {
+                        "success": False,
+                        "error":
+                            error_message,
+                        "short_id":
+                            short_id,
+                        "platform":
+                            platform,
+                    },
+                )
+                return
+
+            await self.send_json(
+                send,
+                200,
+                {
+                    "success": True,
+                    "short_id":
+                        short_id,
+                    "platform":
+                        platform,
+                    "status":
+                        "requested",
+                    "message": (
+                        "Scheduled publication "
+                        "sent to n8n"
+                    ),
+                    "n8n_http_status":
+                        response_status,
+                    "n8n_response":
+                        response_body[:1000],
+                },
+            )
+            return
+
         # =================================================
         # NORMAL MCP AUTH
         # =================================================
@@ -3414,7 +3938,6 @@ class APIKeyMiddleware:
             supplied_key,
             MCP_API_KEY,
         ):
-
             await self.send_json(
                 send,
                 401,
@@ -3423,7 +3946,6 @@ class APIKeyMiddleware:
                         "Unauthorized",
                 },
             )
-
             return
 
         await self.app(
@@ -3438,7 +3960,6 @@ class APIKeyMiddleware:
 # =========================================================
 
 if __name__ == "__main__":
-
     import uvicorn
 
     print(
@@ -3463,7 +3984,6 @@ if __name__ == "__main__":
     )
 
     for tool in registered_tools:
-
         print(
             f"- {tool.name}",
             flush=True,
