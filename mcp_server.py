@@ -7,6 +7,8 @@ import urllib.request
 import urllib.error
 import urllib.parse
 
+from datetime import datetime, timezone
+
 import psycopg2
 
 from pathlib import Path
@@ -89,7 +91,7 @@ def get_db():
 
 def ensure_database_schema():
     """
-    Add YouTube and Instagram columns if missing.
+    Add YouTube, Instagram and scheduling columns if missing.
     Safe to run on every service start.
     """
 
@@ -140,6 +142,13 @@ def ensure_database_schema():
 
         cur.execute(
             """
+            ALTER TABLE shorts
+            ADD COLUMN IF NOT EXISTS youtube_publish_at TIMESTAMPTZ
+            """
+        )
+
+        cur.execute(
+            """
             UPDATE shorts
             SET youtube_status = 'pending'
             WHERE youtube_status IS NULL
@@ -181,9 +190,40 @@ def ensure_database_schema():
 
         cur.execute(
             """
+            ALTER TABLE shorts
+            ADD COLUMN IF NOT EXISTS instagram_publish_at TIMESTAMPTZ
+            """
+        )
+
+        cur.execute(
+            """
             UPDATE shorts
             SET instagram_status = 'pending'
             WHERE instagram_status IS NULL
+            """
+        )
+
+        # -------------------------
+        # Scheduling indexes
+        # -------------------------
+
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_shorts_youtube_publish_at
+            ON shorts (
+                youtube_publish_at
+            )
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_shorts_instagram_publish_at
+            ON shorts (
+                instagram_publish_at
+            )
             """
         )
 
@@ -1210,6 +1250,355 @@ def download_completed_video(
         "persistent_storage": True,
     }
 
+# =========================================================
+# PUBLICATION SCHEDULING
+# =========================================================
+
+def parse_publish_at(
+    publish_at: str,
+):
+    """
+    Parse ISO-8601 datetime with timezone.
+
+    Examples:
+    2026-09-08T18:00:00+03:00
+    2026-09-08T15:00:00Z
+    """
+
+    value = str(
+        publish_at
+    ).strip()
+
+    if not value:
+        raise ValueError(
+            "publish_at cannot be empty"
+        )
+
+    if value.endswith("Z"):
+        value = (
+            value[:-1]
+            + "+00:00"
+        )
+
+    parsed = datetime.fromisoformat(
+        value
+    )
+
+    if parsed.tzinfo is None:
+        raise ValueError(
+            "publish_at must include timezone, "
+            "for example +03:00"
+        )
+
+    return parsed
+
+
+@mcp.tool()
+def schedule_publication(
+    short_id: int,
+    platform: str,
+    publish_at: str,
+) -> dict:
+    """
+    Schedule one completed Short.
+
+    platform:
+    - youtube
+    - instagram
+
+    publish_at:
+    ISO-8601 datetime with timezone.
+
+    Example:
+    2026-09-08T18:00:00+03:00
+
+    Does NOT publish immediately.
+    """
+
+    platform = str(
+        platform
+    ).strip().lower()
+
+    if platform not in {
+        "youtube",
+        "instagram",
+    }:
+        return {
+            "success": False,
+            "error": (
+                "platform must be "
+                "'youtube' or 'instagram'"
+            ),
+        }
+
+    try:
+        publish_datetime = (
+            parse_publish_at(
+                publish_at
+            )
+        )
+
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": str(exc),
+        }
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    try:
+
+        cur.execute(
+            """
+            SELECT
+                id,
+                status,
+                youtube_status,
+                instagram_status
+            FROM shorts
+            WHERE id = %s
+            """,
+            (short_id,),
+        )
+
+        row = cur.fetchone()
+
+        if not row:
+            return {
+                "success": False,
+                "error": "Short not found",
+                "short_id": short_id,
+            }
+
+        (
+            short_id_db,
+            status,
+            youtube_status,
+            instagram_status,
+        ) = row
+
+        if status != "completed":
+            return {
+                "success": False,
+                "error": (
+                    "Only completed Shorts "
+                    "can be scheduled"
+                ),
+                "short_id": short_id,
+                "status": status,
+            }
+
+        file_path = Path(
+            f"/videos/short_{short_id_db}.mp4"
+        )
+
+        if not file_path.is_file():
+            return {
+                "success": False,
+                "error": (
+                    "Video file is not stored "
+                    "in Railway Volume"
+                ),
+                "short_id": short_id,
+            }
+
+        if platform == "youtube":
+
+            if youtube_status == "published":
+                return {
+                    "success": False,
+                    "error": (
+                        "Short is already "
+                        "published on YouTube"
+                    ),
+                    "short_id": short_id,
+                }
+
+            if youtube_status == "requested":
+                return {
+                    "success": False,
+                    "error": (
+                        "YouTube publication "
+                        "is already in progress"
+                    ),
+                    "short_id": short_id,
+                }
+
+            cur.execute(
+                """
+                UPDATE shorts
+                SET
+                    youtube_publish_at = %s,
+                    youtube_status = 'scheduled',
+                    youtube_last_error = NULL,
+                    updated_at = NOW()
+                WHERE id = %s
+                RETURNING
+                    id,
+                    youtube_publish_at,
+                    youtube_status
+                """,
+                (
+                    publish_datetime,
+                    short_id,
+                ),
+            )
+
+        else:
+
+            if instagram_status == "published":
+                return {
+                    "success": False,
+                    "error": (
+                        "Short is already "
+                        "published on Instagram"
+                    ),
+                    "short_id": short_id,
+                }
+
+            if instagram_status == "requested":
+                return {
+                    "success": False,
+                    "error": (
+                        "Instagram publication "
+                        "is already in progress"
+                    ),
+                    "short_id": short_id,
+                }
+
+            cur.execute(
+                """
+                UPDATE shorts
+                SET
+                    instagram_publish_at = %s,
+                    instagram_status = 'scheduled',
+                    instagram_last_error = NULL,
+                    updated_at = NOW()
+                WHERE id = %s
+                RETURNING
+                    id,
+                    instagram_publish_at,
+                    instagram_status
+                """,
+                (
+                    publish_datetime,
+                    short_id,
+                ),
+            )
+
+        updated = cur.fetchone()
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "short_id": updated[0],
+            "platform": platform,
+            "publish_at": (
+                updated[1].isoformat()
+            ),
+            "status": updated[2],
+        }
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+@mcp.tool()
+def get_due_publications(
+    limit: int = 30,
+) -> dict:
+    """
+    Return scheduled publications
+    whose publish time has arrived.
+
+    Read-only.
+    Does NOT publish anything.
+    """
+
+    limit = max(
+        1,
+        min(limit, 30),
+    )
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    try:
+
+        cur.execute(
+            """
+            SELECT *
+            FROM (
+                SELECT
+                    id,
+                    topic,
+                    'youtube' AS platform,
+                    youtube_publish_at AS publish_at
+                FROM shorts
+                WHERE status = 'completed'
+                  AND youtube_status = 'scheduled'
+                  AND youtube_publish_at IS NOT NULL
+                  AND youtube_publish_at <= NOW()
+
+                UNION ALL
+
+                SELECT
+                    id,
+                    topic,
+                    'instagram' AS platform,
+                    instagram_publish_at AS publish_at
+                FROM shorts
+                WHERE status = 'completed'
+                  AND instagram_status = 'scheduled'
+                  AND instagram_publish_at IS NOT NULL
+                  AND instagram_publish_at <= NOW()
+            ) AS due
+            ORDER BY publish_at ASC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+
+        rows = cur.fetchall()
+
+    finally:
+        cur.close()
+        conn.close()
+
+    publications = []
+
+    for row in rows:
+
+        publications.append({
+            "short_id": row[0],
+            "topic": row[1],
+            "platform": row[2],
+            "publish_at": (
+                row[3].isoformat()
+                if row[3]
+                else None
+            ),
+        })
+
+    return {
+        "count": len(
+            publications
+        ),
+        "publications":
+            publications,
+        "checked_at": (
+            datetime.now(
+                timezone.utc
+            ).isoformat()
+        ),
+    }
 
 # =========================================================
 # YOUTUBE PUBLISH VIA N8N
