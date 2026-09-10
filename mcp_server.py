@@ -1234,7 +1234,7 @@ def download_completed_video(
         file_path.stat().st_size
     )
 
-    return {
+       return {
         "success": True,
         "short_id": short_id,
         "file_name": file_path.name,
@@ -1249,6 +1249,71 @@ def download_completed_video(
         "temporary": False,
         "persistent_storage": True,
     }
+
+
+# =========================================================
+# VIDEO FILE DELETE FROM RAILWAY VOLUME
+# =========================================================
+
+@mcp.tool()
+def delete_video_file(
+    short_id: int,
+) -> dict:
+    """
+    Delete only the local MP4 file
+    from Railway Volume /videos.
+
+    Does NOT delete or modify
+    the database record.
+    """
+
+    file_path = Path(
+        f"/videos/short_{short_id}.mp4"
+    )
+
+    if not file_path.is_file():
+        return {
+            "success": False,
+            "status": "not_found",
+            "short_id": short_id,
+            "file_path": str(file_path),
+            "message": (
+                "Local video file does not exist. "
+                "Database was not changed."
+            ),
+        }
+
+    try:
+        size_bytes = file_path.stat().st_size
+        size_mb = round(
+            size_bytes / 1024 / 1024,
+            2,
+        )
+
+        file_path.unlink()
+
+        return {
+            "success": True,
+            "status": "deleted",
+            "short_id": short_id,
+            "file_path": str(file_path),
+            "freed_bytes": size_bytes,
+            "freed_mb": size_mb,
+            "message": (
+                "Local MP4 deleted. "
+                "Database was not changed."
+            ),
+        }
+
+    except Exception as exc:
+        return {
+            "success": False,
+            "status": "error",
+            "short_id": short_id,
+            "file_path": str(file_path),
+            "error": str(exc),
+        }
+
 
 # =========================================================
 # PUBLICATION SCHEDULING
