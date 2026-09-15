@@ -430,6 +430,85 @@ def create_instagram_video_url(
 # READ-ONLY TOOLS
 # =========================================================
 
+# =========================================================
+# PROJECT READ-ONLY TOOLS
+# =========================================================
+
+def _read_projects(active_only: bool = False, project_id: int | None = None) -> list:
+    """Read projects and all their looks in one consistent query."""
+    conn = get_db()
+    try:
+        conn.set_session(readonly=True)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT p.id, p.code, p.name, p.heygen_character_name,
+                       p.heygen_voice_id, p.is_active,
+                       l.id, l.heygen_avatar_id, l.look_name,
+                       l.sort_order, l.is_active
+                FROM projects p
+                LEFT JOIN project_avatar_looks l ON l.project_id = p.id
+                WHERE (%s = FALSE OR p.is_active = TRUE)
+                  AND (%s::INTEGER IS NULL OR p.id = %s)
+                ORDER BY p.id, l.sort_order, l.id
+                """,
+                (active_only, project_id, project_id),
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    projects = {}
+    for row in rows:
+        if row[0] not in projects:
+            projects[row[0]] = {
+                "id": row[0],
+                "code": row[1],
+                "name": row[2],
+                "heygen_character_name": row[3],
+                "heygen_voice_id": row[4],
+                "is_active": row[5],
+                "avatar_looks": [],
+            }
+        if row[6] is not None:
+            projects[row[0]]["avatar_looks"].append({
+                "id": row[6],
+                "heygen_avatar_id": row[7],
+                "look_name": row[8],
+                "sort_order": row[9],
+                "is_active": row[10],
+            })
+    return list(projects.values())
+
+
+@mcp.tool()
+def get_projects(active_only: bool = False) -> dict:
+    """
+    List project settings, character, voice and looks. Read-only.
+    By default includes inactive project placeholders.
+    active_only filters projects; all looks include their own is_active flag.
+    Does not create videos, publish, or change settings.
+    """
+    projects = _read_projects(active_only=active_only)
+    return {"count": len(projects), "projects": projects}
+
+
+@mcp.tool()
+def get_project(project_id: int) -> dict:
+    """
+    Get one project by positive integer ID, including inactive projects.
+    Returns its character, voice and all looks with their activity flags.
+    Read-only. Does not create videos, publish, or change settings.
+    """
+    if project_id < 1 or project_id > 2147483647:
+        return {"found": False, "error": "project_id must be a positive PostgreSQL INTEGER"}
+    projects = _read_projects(project_id=project_id)
+    if not projects:
+        return {"found": False, "error": "Project not found"}
+    return {"found": True, "project": projects[0]}
+
+
+
 @mcp.tool()
 def get_approved_shorts(
     limit: int = 30,
