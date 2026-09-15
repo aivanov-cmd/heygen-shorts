@@ -130,6 +130,14 @@ def ensure_database_schema():
             )
         """)
 
+        # Destination identifiers only; credentials remain in n8n/environment.
+        for column in (
+            "youtube_channel_id", "instagram_account_id",
+            "telegram_channel_id", "telegram_bot_username",
+            "telegram_gift_url", "comment_keyword",
+        ):
+            cur.execute(f"ALTER TABLE projects ADD COLUMN IF NOT EXISTS {column} TEXT")
+
         # Seed only missing rows; later project settings survive restarts.
         for project_id, code, name in (
             (1, "partnerkin_practice", "Partnerkin Practice"),
@@ -445,7 +453,10 @@ def _read_projects(active_only: bool = False, project_id: int | None = None) -> 
                 SELECT p.id, p.code, p.name, p.heygen_character_name,
                        p.heygen_voice_id, p.is_active,
                        l.id, l.heygen_avatar_id, l.look_name,
-                       l.sort_order, l.is_active
+                       l.sort_order, l.is_active,
+                       p.youtube_channel_id, p.instagram_account_id,
+                       p.telegram_channel_id, p.telegram_bot_username,
+                       p.telegram_gift_url, p.comment_keyword
                 FROM projects p
                 LEFT JOIN project_avatar_looks l ON l.project_id = p.id
                 WHERE (%s = FALSE OR p.is_active = TRUE)
@@ -469,6 +480,14 @@ def _read_projects(active_only: bool = False, project_id: int | None = None) -> 
                 "heygen_voice_id": row[4],
                 "is_active": row[5],
                 "avatar_looks": [],
+                "channels": {
+                    "youtube_channel_id": row[11],
+                    "instagram_account_id": row[12],
+                    "telegram_channel_id": row[13],
+                    "telegram_bot_username": row[14],
+                    "telegram_gift_url": row[15],
+                    "comment_keyword": row[16],
+                },
             }
         if row[6] is not None:
             projects[row[0]]["avatar_looks"].append({
@@ -507,6 +526,44 @@ def get_project(project_id: int) -> dict:
         return {"found": False, "error": "Project not found"}
     return {"found": True, "project": projects[0]}
 
+
+
+@mcp.tool()
+def get_project_readiness(project_id: int) -> dict:
+    """Read configuration gaps only; never activates or publishes anything.
+    Account IDs do not verify credentials or enable project-aware routing.
+    """
+    result = get_project(project_id)
+    if not result["found"]:
+        return result
+    project = result["project"]
+    missing = []
+    if not project["is_active"]:
+        missing.append("project_inactive")
+    if not project["heygen_voice_id"]:
+        missing.append("heygen_voice_id")
+    if not any(look["is_active"] for look in project["avatar_looks"]):
+        missing.append("active_avatar_look")
+    publication_routes = {}
+    for platform in ("youtube", "instagram"):
+        try:
+            _project_publish_route(project_id, platform)
+            publication_routes[platform] = {"configured": True}
+        except ValueError as exc:
+            publication_routes[platform] = {"configured": False, "reason": str(exc)}
+    return {
+        "found": True,
+        "project_id": project_id,
+        "generation_configuration_complete": not missing,
+        "generation_missing": missing,
+        "channel_fields_missing": [
+            key for key, value in project["channels"].items() if not value
+        ],
+        "publishing_mode": "per_project_webhooks",
+        "publication_routes": publication_routes,
+        "project_routing_verified": False,
+        "note": "Routes configured does not verify n8n credentials or accounts. Keep projects 2-6 inactive until their workflows are configured and checked.",
+    }
 
 
 @mcp.tool()
@@ -1779,7 +1836,7 @@ def get_due_publications(
                     id,
                     topic,
                     'youtube' AS platform,
-                    youtube_publish_at AS publish_at
+                    youtube_publish_at AS publish_at, project_id
                 FROM shorts
                 WHERE status = 'completed'
                   AND youtube_status = 'scheduled'
@@ -1792,7 +1849,7 @@ def get_due_publications(
                     id,
                     topic,
                     'instagram' AS platform,
-                    instagram_publish_at AS publish_at
+                    instagram_publish_at AS publish_at, project_id
                 FROM shorts
                 WHERE status = 'completed'
                   AND instagram_status = 'scheduled'
@@ -1819,6 +1876,7 @@ def get_due_publications(
             "short_id": row[0],
             "topic": row[1],
             "platform": row[2],
+            "project_id": row[4],
             "publish_at": (
                 row[3].isoformat()
                 if row[3]
@@ -1843,6 +1901,53 @@ def get_due_publications(
 # YOUTUBE PUBLISH VIA N8N
 # =========================================================
 
+def _project_publish_route(project_id: int, platform: str) -> dict:
+    """Resolve server-owned routes; never fall back to project 1 for other IDs."""
+    if platform not in ("youtube", "instagram"):
+        raise ValueError("Unsupported publication platform")
+    suffix = platform.upper()
+    if project_id == 1:
+        url = (N8N_YOUTUBE_WEBHOOK_URL if platform == "youtube"
+               else N8N_INSTAGRAM_WEBHOOK_URL)
+    else:
+        if os.environ.get(f"N8N_PROJECT_{project_id}_PUBLISH_ENABLED", "").lower() != "true":
+            raise ValueError("Project publication routing is not enabled")
+        url = os.environ.get(f"N8N_PROJECT_{project_id}_{suffix}_WEBHOOK_URL")
+    if not url:
+        raise ValueError("Project publication webhook is not configured")
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+        raise ValueError("Project webhook must be an HTTPS URL without embedded credentials")
+    return {"url": url}
+
+
+def _short_publish_context(short_id: int, platform: str) -> dict:
+    conn = get_db()
+    try:
+        conn.set_session(readonly=True)
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT p.id, p.code, p.is_active,
+                       p.youtube_channel_id, p.instagram_account_id
+                FROM shorts s JOIN projects p ON p.id = s.project_id
+                WHERE s.id = %s
+            """, (short_id,))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise ValueError("Short or project not found")
+    if not row[2]:
+        raise ValueError("Project is inactive")
+    if row[0] != 1 and not (row[3] if platform == "youtube" else row[4]):
+        raise ValueError("Project destination account is not configured")
+    route = _project_publish_route(row[0], platform)
+    return {
+        "project_id": row[0], "project_code": row[1],
+        "webhook_url": route["url"],
+    }
+
+
 @mcp.tool()
 def publish_to_youtube(
     short_id: int,
@@ -1857,6 +1962,11 @@ def publish_to_youtube(
 
     Final success comes through callback.
     """
+
+    try:
+        publish_context = _short_publish_context(short_id, "youtube")
+    except ValueError as exc:
+        return {"success": False, "short_id": short_id, "error": str(exc)}
 
     conn = get_db()
     cur = conn.cursor()
@@ -1971,6 +2081,8 @@ def publish_to_youtube(
             }
 
     payload = {
+        "project_id": publish_context["project_id"],
+        "project_code": publish_context["project_code"],
         "short_id": short_id,
         "title": youtube_title,
         "description":
@@ -1983,7 +2095,7 @@ def publish_to_youtube(
     ).encode("utf-8")
 
     request = urllib.request.Request(
-        N8N_YOUTUBE_WEBHOOK_URL,
+        publish_context["webhook_url"],
         data=body,
         method="POST",
         headers={
@@ -2175,6 +2287,11 @@ def publish_to_instagram(
     Final success comes through callback.
     """
 
+    try:
+        publish_context = _short_publish_context(short_id, "instagram")
+    except ValueError as exc:
+        return {"success": False, "short_id": short_id, "error": str(exc)}
+
     if not N8N_INSTAGRAM_WEBHOOK_URL:
         return {
             "success": False,
@@ -2351,6 +2468,8 @@ def publish_to_instagram(
     )
 
     payload = {
+        "project_id": publish_context["project_id"],
+        "project_code": publish_context["project_code"],
         "short_id": short_id,
         "caption": final_caption,
         "video_url":
@@ -2389,7 +2508,7 @@ def publish_to_instagram(
         conn.close()
 
     request = urllib.request.Request(
-        N8N_INSTAGRAM_WEBHOOK_URL,
+        publish_context["webhook_url"],
         data=body,
         method="POST",
         headers={
@@ -3500,7 +3619,7 @@ class APIKeyMiddleware:
                             id,
                             topic,
                             'youtube' AS platform,
-                            youtube_publish_at AS publish_at
+                            youtube_publish_at AS publish_at, project_id
                         FROM shorts
                         WHERE status = 'completed'
                           AND youtube_status = 'scheduled'
@@ -3513,7 +3632,7 @@ class APIKeyMiddleware:
                             id,
                             topic,
                             'instagram' AS platform,
-                            instagram_publish_at AS publish_at
+                            instagram_publish_at AS publish_at, project_id
                         FROM shorts
                         WHERE status = 'completed'
                           AND instagram_status = 'scheduled'
@@ -3538,6 +3657,7 @@ class APIKeyMiddleware:
                     "short_id": row[0],
                     "topic": row[1],
                     "platform": row[2],
+            "project_id": row[4],
                     "publish_at": (
                         row[3].isoformat()
                         if row[3]
@@ -3656,6 +3776,15 @@ class APIKeyMiddleware:
             short_id = int(
                 short_id_text
             )
+
+            try:
+                publish_context = _short_publish_context(short_id, platform)
+            except ValueError as exc:
+                await self.send_json(send, 409, {
+                    "success": False, "short_id": short_id,
+                    "platform": platform, "error": str(exc),
+                })
+                return
 
             file_path = Path(
                 f"/videos/short_{short_id}.mp4"
@@ -3974,6 +4103,10 @@ class APIKeyMiddleware:
             # ---------------------------------------------
             # Call existing n8n workflow
             # ---------------------------------------------
+
+            payload["project_id"] = publish_context["project_id"]
+            payload["project_code"] = publish_context["project_code"]
+            webhook_url = publish_context["webhook_url"]
 
             body = json.dumps(
                 payload,
