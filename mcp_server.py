@@ -91,7 +91,7 @@ def get_db():
 
 def ensure_database_schema():
     """
-    Add YouTube, Instagram and scheduling columns if missing.
+    Add project architecture, YouTube, Instagram and scheduling schema.
     Safe to run on every service start.
     """
 
@@ -99,6 +99,103 @@ def ensure_database_schema():
     cur = conn.cursor()
 
     try:
+
+        # Project architecture, stage 1. No publishing/generation side effects.
+        # Serialize cooperating service startups for the whole transaction.
+        cur.execute("SELECT pg_advisory_xact_lock(721406, 1)")
+        cur.execute("SET LOCAL lock_timeout = '15s'")
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS projects (
+                id INTEGER PRIMARY KEY CHECK (id > 0),
+                code TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                heygen_character_name TEXT,
+                heygen_voice_id TEXT,
+                is_active BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS project_avatar_looks (
+                id BIGSERIAL PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                heygen_avatar_id TEXT NOT NULL UNIQUE,
+                look_name TEXT NOT NULL,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+
+        # Seed only missing rows; later project settings survive restarts.
+        for project_id, code, name in (
+            (1, "partnerkin_practice", "Partnerkin Practice"),
+            (2, "partnerkin_jobs", "Partnerkin Jobs"),
+            (3, "partnerkin_expert", "Partnerkin Expert"),
+            (4, "traffic_inside", "Traffic Inside"),
+            (5, "marketing", "Marketing"),
+            (6, "traffic_math", "Traffic Math"),
+        ):
+            cur.execute("""
+                INSERT INTO projects (
+                    id, code, name, heygen_character_name,
+                    heygen_voice_id, is_active
+                ) VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO NOTHING
+            """, (
+                project_id, code, name,
+                "Oleg" if project_id == 1 else None,
+                "ba1544b5eae84eae9cb92598f078b6b0" if project_id == 1 else None,
+                project_id == 1,
+            ))
+            cur.execute("SELECT code FROM projects WHERE id = %s", (project_id,))
+            if cur.fetchone()[0] != code:
+                raise RuntimeError("Project seed ID/code conflict; migration rolled back")
+
+        for order, avatar_id in enumerate((
+            "f2813391b4a74544bd18d0b22c2251c0",
+            "edd35073c03b4af2a8ddb07b0c62e9cc",
+            "31c27d30df2d447089cd1fb41e58959e",
+        ), start=1):
+            cur.execute("""
+                INSERT INTO project_avatar_looks (
+                    project_id, heygen_avatar_id, look_name, sort_order
+                ) VALUES (1, %s, %s, %s)
+                ON CONFLICT (heygen_avatar_id) DO NOTHING
+            """, (avatar_id, f"Look {order}", order))
+            cur.execute("""
+                SELECT project_id FROM project_avatar_looks
+                WHERE heygen_avatar_id = %s
+            """, (avatar_id,))
+            if cur.fetchone()[0] != 1:
+                raise RuntimeError("HeyGen look belongs to another project; migration rolled back")
+
+        cur.execute("ALTER TABLE shorts ADD COLUMN IF NOT EXISTS project_id INTEGER")
+        # The existing INSERT has an explicit column list and omits project_id.
+        cur.execute("ALTER TABLE shorts ALTER COLUMN project_id SET DEFAULT 1")
+        cur.execute("UPDATE shorts SET project_id = 1 WHERE project_id IS NULL")
+        cur.execute("ALTER TABLE shorts ALTER COLUMN project_id SET NOT NULL")
+        cur.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conrelid = 'shorts'::regclass
+                      AND conname = 'shorts_project_id_fkey'
+                ) THEN
+                    ALTER TABLE shorts ADD CONSTRAINT shorts_project_id_fkey
+                        FOREIGN KEY (project_id) REFERENCES projects(id);
+                END IF;
+            END $$
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_shorts_project_id ON shorts(project_id)")
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_project_avatar_looks_project_order
+            ON project_avatar_looks(project_id, sort_order)
+        """)
 
         # -------------------------
         # YouTube
