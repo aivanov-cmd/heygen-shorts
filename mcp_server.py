@@ -205,6 +205,39 @@ def ensure_database_schema():
             ON project_avatar_looks(project_id, sort_order)
         """)
 
+        # Apply this settings revision once; subsequent edits survive restarts.
+        cur.execute("""CREATE TABLE IF NOT EXISTS partnerkin_schema_migrations (
+            version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
+        cur.execute("SELECT 1 FROM partnerkin_schema_migrations WHERE version = %s",
+                    ("projects_2_3_assets_20260918_v1",))
+        if cur.fetchone() is None:
+            for pid, code, voice, youtube, instagram, channel, bot, looks in [(2, 'partnerkin_jobs', '7dd8faee4b4f43dba7442074d8b0827a', 'UCtG5IgAkAtFkVk4uzUqqdyQ', '28926652066967908', '@partnerkin_job', 'vacancy_prtnk_bot', ['2ebadb409c464911b85ca49fa239c3f1', '1b4bfa2c4d3e440f901a802ea00ef34d', '82c36018c45940e3959fd7e3924545c1']), (3, 'partnerkin_expert', '4fe816ff5ed54776b6daf61eabb18552', 'UCtg18yOJpLaLHuPv12xhGcg', '28636845245952678', '@thepartnerkin_gambl', 'Partnerkin_expert_bot', ['e99d199bfa9240dca437fa702fe9930c', '733a5d974b2148cf9960157a1b0413eb', '2fe3b6ec944148c28ea45f779da899ec'])]:
+                cur.execute("SELECT code FROM projects WHERE id = %s FOR UPDATE", (pid,))
+                row = cur.fetchone()
+                if not row or row[0] != code:
+                    raise RuntimeError("Project identity conflict; settings migration rolled back")
+                cur.execute("""UPDATE projects SET heygen_voice_id = %s,
+                    youtube_channel_id = %s, instagram_account_id = %s,
+                    telegram_channel_id = %s, telegram_bot_username = %s,
+                    is_active = TRUE, updated_at = NOW() WHERE id = %s""",
+                    (voice, youtube, instagram, channel, bot, pid))
+                # Retain historic look rows, but only the latest approved looks are active.
+                cur.execute("UPDATE project_avatar_looks SET is_active = FALSE, updated_at = NOW() WHERE project_id = %s", (pid,))
+                for order, avatar in enumerate(looks, 1):
+                    cur.execute("SELECT project_id FROM project_avatar_looks WHERE heygen_avatar_id = %s", (avatar,))
+                    owner = cur.fetchone()
+                    if owner and owner[0] != pid:
+                        raise RuntimeError("HeyGen look belongs to another project; migration rolled back")
+                    cur.execute("""INSERT INTO project_avatar_looks
+                        (project_id, heygen_avatar_id, look_name, sort_order, is_active)
+                        VALUES (%s, %s, %s, %s, TRUE)
+                        ON CONFLICT (heygen_avatar_id) DO UPDATE SET
+                        look_name = EXCLUDED.look_name, sort_order = EXCLUDED.sort_order,
+                        is_active = TRUE, updated_at = NOW()""", (pid, avatar, f"Look {order}", order))
+            cur.execute("INSERT INTO partnerkin_schema_migrations(version) VALUES (%s)",
+                        ("projects_2_3_assets_20260918_v1",))
+
         # -------------------------
         # YouTube
         # -------------------------
@@ -341,6 +374,7 @@ def ensure_database_schema():
     finally:
         cur.close()
         conn.close()
+
 
 
 # =========================================================
@@ -597,7 +631,8 @@ def get_approved_shorts(
                 youtube_description,
                 youtube_status,
                 instagram_caption,
-                instagram_status
+                instagram_status,
+                project_id
             FROM shorts
             WHERE status = 'approved'
               AND heygen_video_id IS NULL
@@ -629,12 +664,14 @@ def get_approved_shorts(
             "youtube_status": row[8],
             "instagram_caption": row[9],
             "instagram_status": row[10],
+            "project_id": row[11],
         })
 
     return {
         "count": len(shorts),
         "shorts": shorts,
     }
+
 
 
 @mcp.tool()
@@ -671,7 +708,8 @@ def get_short(
                 instagram_caption,
                 instagram_media_id,
                 instagram_status,
-                instagram_last_error
+                instagram_last_error,
+                project_id
             FROM shorts
             WHERE id = %s
             """,
@@ -714,8 +752,10 @@ def get_short(
             "instagram_media_id": row[16],
             "instagram_status": row[17],
             "instagram_last_error": row[18],
+            "project_id": row[19],
         },
     }
+
 
 
 @mcp.tool()
@@ -812,8 +852,7 @@ def get_queue_stats() -> dict:
 # CREATE BATCH
 # =========================================================
 
-@mcp.tool()
-def create_shorts_batch(
+def _create_shorts_batch_legacy(
     shorts: list[dict],
 ) -> dict:
     """
@@ -1087,6 +1126,104 @@ def create_shorts_batch(
     finally:
         cur.close()
         conn.close()
+
+
+@mcp.tool()
+def create_shorts_batch(shorts: list[dict], project_id: int = 1) -> dict:
+    """Create approved Shorts for one project; never generate or publish.
+
+    Required per Short: topic, script, youtube_title, youtube_description.
+    Optional: instagram_caption, avatar_id, voice_id.
+    Voice defaults to the project's voice; omitted avatar uses active looks
+    in sort_order, cycling within this batch. Explicit IDs must belong to
+    this project. Existing callers default to project 1. Maximum 30 Shorts.
+    """
+    if type(project_id) is not int or not 1 <= project_id <= 2147483647:
+        return {"success": False, "error": "project_id must be a positive INTEGER"}
+    if project_id == 1:
+        if any(isinstance(item, dict) and "project_id" in item and
+               (type(item["project_id"]) is not int or item["project_id"] != 1)
+               for item in shorts):
+            return {"success": False, "error": "Item project_id differs from batch project_id"}
+        return _create_shorts_batch_legacy(shorts)
+    if not shorts or len(shorts) > 30:
+        return {"success": False, "error": "Provide 1 to 30 Shorts per batch"}
+    validated = []
+    for index, item in enumerate(shorts, start=1):
+        if not isinstance(item, dict):
+            return {"success": False, "error": f"Short #{index}: expected an object"}
+        if "project_id" in item and (type(item["project_id"]) is not int or item["project_id"] != project_id):
+            return {"success": False, "error": f"Short #{index}: project_id differs from batch project_id"}
+        fields = {}
+        for field in ("topic", "script", "youtube_title", "youtube_description", "instagram_caption", "avatar_id", "voice_id"):
+            value = item.get(field)
+            fields[field] = "" if value is None else str(value).strip()
+        for field in ("topic", "script", "youtube_title", "youtube_description"):
+            if not fields[field]:
+                return {"success": False, "error": f"Short #{index}: {field} is required"}
+        if len(fields["youtube_title"]) > 100:
+            return {"success": False, "error": f"Short #{index}: youtube_title must be 100 characters or less"}
+        fields["instagram_caption"] = fields["instagram_caption"] or fields["youtube_description"]
+        validated.append(fields)
+
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            # Hold project/look settings steady until the whole batch commits.
+            cur.execute("SELECT is_active, heygen_voice_id FROM projects WHERE id = %s FOR SHARE", (project_id,))
+            project = cur.fetchone()
+            if not project or not project[0] or not project[1]:
+                raise ValueError("Project is missing, inactive, or has no voice configured")
+            voice = project[1]
+            cur.execute("""
+                SELECT heygen_avatar_id FROM project_avatar_looks
+                WHERE project_id = %s AND is_active = TRUE
+                ORDER BY sort_order, id FOR SHARE
+            """, (project_id,))
+            looks = [row[0] for row in cur.fetchall()]
+            if not looks:
+                raise ValueError("Project has no active HeyGen looks")
+            # Validate every item before the first INSERT (all-or-nothing).
+            for index, item in enumerate(validated):
+                if item["voice_id"] and item["voice_id"] != voice:
+                    raise ValueError(f"Short #{index + 1}: voice_id does not match project")
+                if item["avatar_id"] and item["avatar_id"] not in looks:
+                    raise ValueError(f"Short #{index + 1}: avatar_id is not an active look of this project")
+                item["voice_id"] = voice
+                item["avatar_id"] = item["avatar_id"] or looks[index % len(looks)]
+            created = []
+            columns = ("id", "topic", "status", "avatar_id", "voice_id", "youtube_title",
+                       "youtube_description", "youtube_status", "instagram_caption", "instagram_status", "project_id")
+            for item in validated:
+                cur.execute("""
+                    INSERT INTO shorts (
+                        topic, script, avatar_id, voice_id, status,
+                        heygen_video_id, video_url, subtitle_url, last_error,
+                        youtube_title, youtube_description, youtube_video_id,
+                        youtube_status, youtube_last_error,
+                        instagram_caption, instagram_media_id, instagram_status,
+                        instagram_last_error, created_at, updated_at, project_id
+                    ) VALUES (
+                        %s, %s, %s, %s, 'approved', NULL, NULL, NULL, NULL,
+                        %s, %s, NULL, 'pending', NULL,
+                        %s, NULL, 'pending', NULL, NOW(), NOW(), %s
+                    ) RETURNING id, topic, status, avatar_id, voice_id,
+                        youtube_title, youtube_description, youtube_status,
+                        instagram_caption, instagram_status, project_id
+                """, (item["topic"], item["script"], item["avatar_id"], item["voice_id"],
+                      item["youtube_title"], item["youtube_description"], item["instagram_caption"], project_id))
+                created.append(dict(zip(columns, cur.fetchone())))
+        conn.commit()
+        return {"success": True, "count": len(created), "shorts": created}
+    except ValueError as exc:
+        conn.rollback()
+        return {"success": False, "error": str(exc), "project_id": project_id}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
 
 
 # =========================================================
