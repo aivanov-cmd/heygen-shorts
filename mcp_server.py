@@ -2038,6 +2038,72 @@ def get_due_publications(
 # YOUTUBE PUBLISH VIA N8N
 # =========================================================
 
+def _project_secret(project_id: int, platform: str, purpose: str) -> str:
+    """Separate publish/callback keys for new projects; retain legacy 1-3."""
+    if platform not in ("youtube", "instagram") or purpose not in ("WEBHOOK", "CALLBACK"):
+        raise ValueError("Invalid key scope")
+    if project_id in (1, 2, 3):
+        return (N8N_YOUTUBE_WEBHOOK_KEY if platform == "youtube" else N8N_INSTAGRAM_WEBHOOK_KEY) or ""
+    if project_id not in (4, 5, 6):
+        raise ValueError("Unsupported project")
+    name = f"N8N_PROJECT_{project_id}_{platform.upper()}_{purpose}_KEY"
+    key = os.environ.get(name, "")
+    if len(key) < 32 or key != key.strip() or not key.isascii():
+        raise ValueError(f"{name} requires a unique ASCII key of at least 32 characters")
+    if key in (MCP_API_KEY, VIDEO_DOWNLOAD_API_KEY, N8N_YOUTUBE_WEBHOOK_KEY, N8N_INSTAGRAM_WEBHOOK_KEY):
+        raise ValueError("Project key must not reuse shared infrastructure keys")
+    for pid in (4, 5, 6):
+        for service in ("YOUTUBE", "INSTAGRAM"):
+            for kind in ("WEBHOOK", "CALLBACK"):
+                other = f"N8N_PROJECT_{pid}_{service}_{kind}_KEY"
+                if other != name and os.environ.get(other) == key:
+                    raise ValueError("Project keys must be distinct")
+    return key
+
+
+def _validate_isolated_route(project_id: int, platform: str, url: str) -> None:
+    """Strict route convention for 4-6 only. Never change legacy routes."""
+    parsed = urllib.parse.urlsplit(url)
+    expected = f"/webhook/publish-{platform}-project-{project_id}"
+    if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+            or parsed.query or parsed.fragment or parsed.path != expected or url != url.strip()):
+        raise ValueError(f"Project requires HTTPS production webhook path {expected}")
+    def canonical(value):
+        p = urllib.parse.urlsplit(value or "")
+        return (p.scheme.lower(), (p.netloc or "").lower(), urllib.parse.unquote(p.path).rstrip("/"))
+    current = canonical(url)
+    if current in (canonical(N8N_YOUTUBE_WEBHOOK_URL), canonical(N8N_INSTAGRAM_WEBHOOK_URL)):
+        raise ValueError("Project route reuses a legacy webhook")
+    for pid in range(2, 7):
+        for service in ("youtube", "instagram"):
+            if (pid, service) != (project_id, platform):
+                other = os.environ.get(f"N8N_PROJECT_{pid}_{service.upper()}_WEBHOOK_URL", "")
+                if other and canonical(other) == current:
+                    raise ValueError("Project routes must be unique")
+
+
+def _callback_project(short_id: int, platform: str, headers: dict) -> int:
+    """Use the stored owner, never a claimed payload project, to choose key."""
+    conn = get_db()
+    try:
+        conn.set_session(readonly=True)
+        with conn.cursor() as cur:
+            cur.execute("SELECT project_id FROM shorts WHERE id = %s", (short_id,))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise ValueError("Unauthorized callback")
+    pid = row[0]
+    expected = _project_secret(pid, platform, "CALLBACK")
+    header = N8N_YOUTUBE_WEBHOOK_HEADER if platform == "youtube" else N8N_INSTAGRAM_WEBHOOK_HEADER
+    supplied = headers.get(header.lower(), "")
+    if not expected or not hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
+        raise ValueError("Unauthorized callback")
+    return pid
+
+
+
 def _project_publish_route(project_id: int, platform: str) -> dict:
     """Resolve server-owned routes; never fall back to project 1 for other IDs."""
     if platform not in ("youtube", "instagram"):
@@ -2055,6 +2121,10 @@ def _project_publish_route(project_id: int, platform: str) -> dict:
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
         raise ValueError("Project webhook must be an HTTPS URL without embedded credentials")
+    if project_id in (4, 5, 6):
+        _validate_isolated_route(project_id, platform, url)
+        _project_secret(project_id, platform, "WEBHOOK")
+        _project_secret(project_id, platform, "CALLBACK")
     return {"url": url}
 
 
@@ -2082,6 +2152,7 @@ def _short_publish_context(short_id: int, platform: str) -> dict:
     return {
         "project_id": row[0], "project_code": row[1],
         "webhook_url": route["url"],
+        "webhook_key": _project_secret(row[0], platform, "WEBHOOK"),
     }
 
 
@@ -2239,9 +2310,32 @@ def publish_to_youtube(
             "Content-Type":
                 "application/json",
             N8N_YOUTUBE_WEBHOOK_HEADER:
-                N8N_YOUTUBE_WEBHOOK_KEY,
+                publish_context["webhook_key"],
         },
     )
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    try:
+
+        cur.execute(
+            """
+            UPDATE shorts
+            SET
+                youtube_status = 'requested',
+                youtube_last_error = NULL,
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (short_id,),
+        )
+
+        conn.commit()
+
+    finally:
+        cur.close()
+        conn.close()
 
     try:
 
@@ -2361,29 +2455,6 @@ def publish_to_youtube(
             ),
             "short_id": short_id,
         }
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    try:
-
-        cur.execute(
-            """
-            UPDATE shorts
-            SET
-                youtube_status = 'requested',
-                youtube_last_error = NULL,
-                updated_at = NOW()
-            WHERE id = %s
-            """,
-            (short_id,),
-        )
-
-        conn.commit()
-
-    finally:
-        cur.close()
-        conn.close()
 
     return {
         "success": True,
@@ -2652,7 +2723,7 @@ def publish_to_instagram(
             "Content-Type":
                 "application/json",
             N8N_INSTAGRAM_WEBHOOK_HEADER:
-                N8N_INSTAGRAM_WEBHOOK_KEY,
+                publish_context["webhook_key"],
         },
     )
 
@@ -3262,25 +3333,6 @@ class APIKeyMiddleware:
         if path.startswith(
             "/youtube-callback/"
         ):
-            callback_key = headers.get(
-                N8N_YOUTUBE_WEBHOOK_HEADER.lower(),
-                "",
-            )
-
-            if not hmac.compare_digest(
-                callback_key,
-                N8N_YOUTUBE_WEBHOOK_KEY,
-            ):
-                await self.send_json(
-                    send,
-                    401,
-                    {
-                        "error":
-                            "Unauthorized",
-                    },
-                )
-                return
-
             if method != "POST":
                 await self.send_json(
                     send,
@@ -3313,6 +3365,12 @@ class APIKeyMiddleware:
                 short_id_text
             )
 
+            try:
+                callback_project_id = _callback_project(short_id, "youtube", headers)
+            except ValueError:
+                await self.send_json(send, 401, {"error": "Unauthorized callback"})
+                return
+
             raw_body = await self.read_body(
                 receive
             )
@@ -3332,6 +3390,16 @@ class APIKeyMiddleware:
                             "Invalid JSON",
                     },
                 )
+                return
+
+            if not isinstance(payload, dict):
+                await self.send_json(send, 400, {"error": "JSON object required"})
+                return
+            if callback_project_id in (4, 5, 6) and (
+                type(payload.get("project_id")) is not int
+                or payload["project_id"] != callback_project_id
+            ):
+                await self.send_json(send, 403, {"error": "Callback project mismatch"})
                 return
 
             youtube_status = str(
@@ -3483,37 +3551,6 @@ class APIKeyMiddleware:
         if path.startswith(
             "/instagram-callback/"
         ):
-            if not N8N_INSTAGRAM_WEBHOOK_KEY:
-                await self.send_json(
-                    send,
-                    500,
-                    {
-                        "error":
-                            "Instagram webhook "
-                            "key is not configured",
-                    },
-                )
-                return
-
-            callback_key = headers.get(
-                N8N_INSTAGRAM_WEBHOOK_HEADER.lower(),
-                "",
-            )
-
-            if not hmac.compare_digest(
-                callback_key,
-                N8N_INSTAGRAM_WEBHOOK_KEY,
-            ):
-                await self.send_json(
-                    send,
-                    401,
-                    {
-                        "error":
-                            "Unauthorized",
-                    },
-                )
-                return
-
             if method != "POST":
                 await self.send_json(
                     send,
@@ -3546,6 +3583,12 @@ class APIKeyMiddleware:
                 short_id_text
             )
 
+            try:
+                callback_project_id = _callback_project(short_id, "instagram", headers)
+            except ValueError:
+                await self.send_json(send, 401, {"error": "Unauthorized callback"})
+                return
+
             raw_body = await self.read_body(
                 receive
             )
@@ -3565,6 +3608,16 @@ class APIKeyMiddleware:
                             "Invalid JSON",
                     },
                 )
+                return
+
+            if not isinstance(payload, dict):
+                await self.send_json(send, 400, {"error": "JSON object required"})
+                return
+            if callback_project_id in (4, 5, 6) and (
+                type(payload.get("project_id")) is not int
+                or payload["project_id"] != callback_project_id
+            ):
+                await self.send_json(send, 403, {"error": "Callback project mismatch"})
                 return
 
             instagram_status = str(
@@ -4244,6 +4297,7 @@ class APIKeyMiddleware:
             payload["project_id"] = publish_context["project_id"]
             payload["project_code"] = publish_context["project_code"]
             webhook_url = publish_context["webhook_url"]
+            webhook_key = publish_context["webhook_key"]
 
             body = json.dumps(
                 payload,
