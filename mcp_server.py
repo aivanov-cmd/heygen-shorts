@@ -238,6 +238,34 @@ def ensure_database_schema():
             cur.execute("INSERT INTO partnerkin_schema_migrations(version) VALUES (%s)",
                         ("projects_2_3_assets_20260918_v1",))
 
+        # Apply confirmed destinations once; later administrative edits survive restarts.
+        channels_revision = "projects_4_6_channels_20260924_v1"
+        cur.execute("SELECT 1 FROM partnerkin_schema_migrations WHERE version = %s",
+                    (channels_revision,))
+        if cur.fetchone() is None:
+            destinations = (
+                (4, "traffic_inside", "UC5-j9KQHvBY61PLfkgrniUA", "17841431701890865",
+                 "-1004348859548", "traffic_inside_materials_bot"),
+                (5, "marketing", "UCAxK9zmS9t_hHPK2NP4odiQ", "17841420313330811",
+                 "-1004489200154", "ad_psychology_materials_bot"),
+                (6, "traffic_math", "UCSvmxOLXiU7_SkiJmanWTcQ", "17841420041620608",
+                 "-1004352725961", "traffic_economics_materials_bot"),
+            )
+            # Validate all identities before any settings update.
+            for pid, code, youtube, instagram, channel, bot in destinations:
+                cur.execute("SELECT code FROM projects WHERE id = %s FOR UPDATE", (pid,))
+                row = cur.fetchone()
+                if not row or row[0] != code:
+                    raise RuntimeError("Project identity conflict; channel migration rolled back")
+            for pid, code, youtube, instagram, channel, bot in destinations:
+                cur.execute("""UPDATE projects SET
+                    youtube_channel_id = %s, instagram_account_id = %s,
+                    telegram_channel_id = %s, telegram_bot_username = %s,
+                    is_active = FALSE, updated_at = NOW()
+                    WHERE id = %s""", (youtube, instagram, channel, bot, pid))
+            cur.execute("INSERT INTO partnerkin_schema_migrations(version) VALUES (%s)",
+                        (channels_revision,))
+
         # -------------------------
         # YouTube
         # -------------------------
