@@ -266,6 +266,37 @@ def ensure_database_schema():
             cur.execute("INSERT INTO partnerkin_schema_migrations(version) VALUES (%s)",
                         (channels_revision,))
 
+        # User-approved provisional looks for 4/6, final selection for 5.
+        assets_revision = "projects_4_6_assets_20260925_v1"
+        cur.execute("SELECT 1 FROM partnerkin_schema_migrations WHERE version = %s",
+                    (assets_revision,))
+        if cur.fetchone() is None:
+            asset_settings = [(4, 'traffic_inside', 'ba1544b5eae84eae9cb92598f078b6b0', ['f76693ce315e458da94ba4994c450589', '1fd99af4b9af4b1c91f5538771518424']), (5, 'marketing', '3097f9a8fd3b4340b6bbe913177b378f', ['48530aa953ab43f3a74b9d4880c4c3d3', '2d99734f7f694746a22c55758611647c', 'cc1758f1b865427c8d9bc52510961a9d']), (6, 'traffic_math', 'ab089e498fde4c0188acca4be0dbfe66', ['3c0393084d8b43e7a5752e997ae3fba2', 'f4098ba84eb2459b8c8df6a857aedf03'])]
+            # Check identities and ownership before changing any project settings.
+            for pid, code, voice, looks in asset_settings:
+                cur.execute("SELECT code FROM projects WHERE id = %s FOR UPDATE", (pid,))
+                row = cur.fetchone()
+                if not row or row[0] != code:
+                    raise RuntimeError("Project identity conflict; avatar migration rolled back")
+                for avatar in looks:
+                    cur.execute("SELECT project_id FROM project_avatar_looks WHERE heygen_avatar_id = %s", (avatar,))
+                    owner = cur.fetchone()
+                    if owner and owner[0] != pid:
+                        raise RuntimeError("HeyGen look belongs to another project; avatar migration rolled back")
+            for pid, code, voice, looks in asset_settings:
+                cur.execute("""UPDATE projects SET heygen_voice_id = %s,
+                    is_active = FALSE, updated_at = NOW() WHERE id = %s""", (voice, pid))
+                cur.execute("UPDATE project_avatar_looks SET is_active = FALSE, updated_at = NOW() WHERE project_id = %s", (pid,))
+                for order, avatar in enumerate(looks, 1):
+                    cur.execute("""INSERT INTO project_avatar_looks
+                        (project_id, heygen_avatar_id, look_name, sort_order, is_active)
+                        VALUES (%s, %s, %s, %s, TRUE)
+                        ON CONFLICT (heygen_avatar_id) DO UPDATE SET
+                        look_name = EXCLUDED.look_name, sort_order = EXCLUDED.sort_order,
+                        is_active = TRUE, updated_at = NOW()""", (pid, avatar, f"Look {order}", order))
+            cur.execute("INSERT INTO partnerkin_schema_migrations(version) VALUES (%s)",
+                        (assets_revision,))
+
         # -------------------------
         # YouTube
         # -------------------------
