@@ -4581,6 +4581,10 @@ class APIKeyMiddleware:
 # START SERVER
 # =========================================================
 
+
+from social_analytics import (AnalyticsMiddleware, ensure_analytics_schema, register_analytics_tools)
+register_analytics_tools(mcp, get_db)
+
 if __name__ == "__main__":
     import uvicorn
 
@@ -4590,7 +4594,7 @@ if __name__ == "__main__":
     )
 
     ensure_database_schema()
-
+    ensure_analytics_schema(get_db)
     print(
         "DATABASE SCHEMA OK",
         flush=True,
@@ -4618,6 +4622,8 @@ if __name__ == "__main__":
     app = APIKeyMiddleware(
         mcp_app
     )
+
+    app = AnalyticsMiddleware(app, get_db)
 
     uvicorn.run(
         app,
