@@ -787,7 +787,7 @@ def get_short(
             "error": "Short not found",
         }
 
-    return {
+    return video_files.enrich_short({
         "found": True,
         "short": {
             "id": row[0],
@@ -813,7 +813,7 @@ def get_short(
             "instagram_last_error": row[18],
             "project_id": row[19],
         },
-    }
+    })
 
 
 
@@ -1550,134 +1550,138 @@ def download_completed_video(
     to persistent Railway Volume.
     """
 
-    conn = get_db()
-    cur = conn.cursor()
+    with video_files.lock(short_id):
+        selected = video_files.download_guard(short_id)
+        if selected is not None:
+            return selected
+        conn = get_db()
+        cur = conn.cursor()
 
-    try:
+        try:
 
-        cur.execute(
-            """
-            SELECT
-                id,
-                status,
-                video_url
-            FROM shorts
-            WHERE id = %s
-            """,
-            (short_id,),
-        )
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    status,
+                    video_url
+                FROM shorts
+                WHERE id = %s
+                """,
+                (short_id,),
+            )
 
-        row = cur.fetchone()
+            row = cur.fetchone()
 
-    finally:
-        cur.close()
-        conn.close()
+        finally:
+            cur.close()
+            conn.close()
 
-    if not row:
-        return {
-            "success": False,
-            "error": "Short not found",
-            "short_id": short_id,
-        }
+        if not row:
+            return {
+                "success": False,
+                "error": "Short not found",
+                "short_id": short_id,
+            }
 
-    (
-        short_id_db,
-        status,
-        video_url,
-    ) = row
-
-    if status != "completed":
-        return {
-            "success": False,
-            "error":
-                "Short is not completed",
-            "short_id": short_id,
-            "status": status,
-        }
-
-    if not video_url:
-        return {
-            "success": False,
-            "error": "video_url is empty",
-            "short_id": short_id,
-        }
-
-    download_dir = Path(
-        "/videos"
-    )
-
-    download_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    file_path = (
-        download_dir
-        / f"short_{short_id_db}.mp4"
-    )
-
-    try:
-
-        request = urllib.request.Request(
+        (
+            short_id_db,
+            status,
             video_url,
-            headers={
-                "User-Agent":
-                    "Mozilla/5.0",
-            },
+        ) = row
+
+        if status != "completed":
+            return {
+                "success": False,
+                "error":
+                    "Short is not completed",
+                "short_id": short_id,
+                "status": status,
+            }
+
+        if not video_url:
+            return {
+                "success": False,
+                "error": "video_url is empty",
+                "short_id": short_id,
+            }
+
+        download_dir = Path(
+            "/videos"
         )
 
-        with urllib.request.urlopen(
-            request,
-            timeout=120,
-        ) as response:
+        download_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
 
-            with open(
-                file_path,
-                "wb",
-            ) as output:
+        file_path = (
+            download_dir
+            / f"short_{short_id_db}.mp4"
+        )
 
-                while True:
+        try:
 
-                    chunk = response.read(
-                        1024 * 1024
-                    )
+            request = urllib.request.Request(
+                video_url,
+                headers={
+                    "User-Agent":
+                        "Mozilla/5.0",
+                },
+            )
 
-                    if not chunk:
-                        break
+            with urllib.request.urlopen(
+                request,
+                timeout=120,
+            ) as response:
 
-                    output.write(chunk)
+                with open(
+                    file_path,
+                    "wb",
+                ) as output:
 
-    except Exception as exc:
+                    while True:
 
-        if file_path.exists():
-            file_path.unlink()
+                        chunk = response.read(
+                            1024 * 1024
+                        )
+
+                        if not chunk:
+                            break
+
+                        output.write(chunk)
+
+        except Exception as exc:
+
+            if file_path.exists():
+                file_path.unlink()
+
+            return {
+                "success": False,
+                "error":
+                    f"Download failed: {exc}",
+                "short_id": short_id,
+            }
+
+        file_size = (
+            file_path.stat().st_size
+        )
 
         return {
-            "success": False,
-            "error":
-                f"Download failed: {exc}",
+            "success": True,
             "short_id": short_id,
+            "file_name": file_path.name,
+            "file_path": str(file_path),
+            "size_bytes": file_size,
+            "size_mb": round(
+                file_size
+                / 1024
+                / 1024,
+                2,
+            ),
+            "temporary": False,
+            "persistent_storage": True,
         }
-
-    file_size = (
-        file_path.stat().st_size
-    )
-
-    return {
-        "success": True,
-        "short_id": short_id,
-        "file_name": file_path.name,
-        "file_path": str(file_path),
-        "size_bytes": file_size,
-        "size_mb": round(
-            file_size
-            / 1024
-            / 1024,
-            2,
-        ),
-        "temporary": False,
-        "persistent_storage": True,
-    }
 
 
 # =========================================================
@@ -1695,52 +1699,53 @@ def delete_video_file(
     Does NOT modify the database.
     """
 
-    file_path = Path(
-        f"/videos/short_{short_id}.mp4"
-    )
-
-    if not file_path.is_file():
-        return {
-            "success": False,
-            "status": "not_found",
-            "short_id": short_id,
-            "file_path": str(file_path),
-            "message": (
-                "Local video file does not exist. "
-                "Database was not changed."
-            ),
-        }
-
-    try:
-        size_bytes = file_path.stat().st_size
-        size_mb = round(
-            size_bytes / 1024 / 1024,
-            2,
+    with video_files.lock(short_id):
+        file_path = Path(
+            f"/videos/short_{short_id}.mp4"
         )
 
-        file_path.unlink()
+        if not file_path.is_file():
+            return {
+                "success": False,
+                "status": "not_found",
+                "short_id": short_id,
+                "file_path": str(file_path),
+                "message": (
+                    "Local video file does not exist. "
+                    "Database was not changed."
+                ),
+            }
 
-        return {
-            "success": True,
-            "status": "deleted",
-            "short_id": short_id,
-            "file_path": str(file_path),
-            "freed_bytes": size_bytes,
-            "freed_mb": size_mb,
-            "message": (
-                "Local MP4 deleted. "
-                "Database was not changed."
-            ),
-        }
+        try:
+            size_bytes = file_path.stat().st_size
+            size_mb = round(
+                size_bytes / 1024 / 1024,
+                2,
+            )
 
-    except Exception as exc:
-        return {
-            "success": False,
-            "status": "error",
-            "short_id": short_id,
-            "file_path": str(file_path),
-            "error": str(exc),
-        }
+            file_path.unlink()
+
+            return {
+                "success": True,
+                "status": "deleted",
+                "short_id": short_id,
+                "file_path": str(file_path),
+                "freed_bytes": size_bytes,
+                "freed_mb": size_mb,
+                "message": (
+                    "Local MP4 deleted. "
+                    "Database was not changed."
+                ),
+            }
+
+        except Exception as exc:
+            return {
+                "success": False,
+                "status": "error",
+                "short_id": short_id,
+                "file_path": str(file_path),
+                "error": str(exc),
+            }
 
 # =========================================================
 # PUBLICATION SCHEDULING
@@ -1807,199 +1812,203 @@ def schedule_publication(
     Does NOT publish immediately.
     """
 
-    platform = str(
-        platform
-    ).strip().lower()
+    with video_files.lock(short_id):
+        file_error = video_files.verify_active_for_publish(short_id)
+        if file_error is not None:
+            return file_error
+        platform = str(
+            platform
+        ).strip().lower()
 
-    if platform not in {
-        "youtube",
-        "instagram",
-    }:
-        return {
-            "success": False,
-            "error": (
-                "platform must be "
-                "'youtube' or 'instagram'"
-            ),
-        }
+        if platform not in {
+            "youtube",
+            "instagram",
+        }:
+            return {
+                "success": False,
+                "error": (
+                    "platform must be "
+                    "'youtube' or 'instagram'"
+                ),
+            }
 
-    try:
-        publish_datetime = (
-            parse_publish_at(
-                publish_at
+        try:
+            publish_datetime = (
+                parse_publish_at(
+                    publish_at
+                )
             )
-        )
 
-    except Exception as exc:
-        return {
-            "success": False,
-            "error": str(exc),
-        }
+        except Exception as exc:
+            return {
+                "success": False,
+                "error": str(exc),
+            }
 
-    conn = get_db()
-    cur = conn.cursor()
+        conn = get_db()
+        cur = conn.cursor()
 
-    try:
+        try:
 
-        cur.execute(
-            """
-            SELECT
-                id,
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    status,
+                    youtube_status,
+                    instagram_status
+                FROM shorts
+                WHERE id = %s
+                """,
+                (short_id,),
+            )
+
+            row = cur.fetchone()
+
+            if not row:
+                return {
+                    "success": False,
+                    "error": "Short not found",
+                    "short_id": short_id,
+                }
+
+            (
+                short_id_db,
                 status,
                 youtube_status,
-                instagram_status
-            FROM shorts
-            WHERE id = %s
-            """,
-            (short_id,),
-        )
+                instagram_status,
+            ) = row
 
-        row = cur.fetchone()
-
-        if not row:
-            return {
-                "success": False,
-                "error": "Short not found",
-                "short_id": short_id,
-            }
-
-        (
-            short_id_db,
-            status,
-            youtube_status,
-            instagram_status,
-        ) = row
-
-        if status != "completed":
-            return {
-                "success": False,
-                "error": (
-                    "Only completed Shorts "
-                    "can be scheduled"
-                ),
-                "short_id": short_id,
-                "status": status,
-            }
-
-        file_path = Path(
-            f"/videos/short_{short_id_db}.mp4"
-        )
-
-        if not file_path.is_file():
-            return {
-                "success": False,
-                "error": (
-                    "Video file is not stored "
-                    "in Railway Volume"
-                ),
-                "short_id": short_id,
-            }
-
-        if platform == "youtube":
-
-            if youtube_status == "published":
+            if status != "completed":
                 return {
                     "success": False,
                     "error": (
-                        "Short is already "
-                        "published on YouTube"
+                        "Only completed Shorts "
+                        "can be scheduled"
                     ),
                     "short_id": short_id,
+                    "status": status,
                 }
 
-            if youtube_status == "requested":
-                return {
-                    "success": False,
-                    "error": (
-                        "YouTube publication "
-                        "is already in progress"
-                    ),
-                    "short_id": short_id,
-                }
-
-            cur.execute(
-                """
-                UPDATE shorts
-                SET
-                    youtube_publish_at = %s,
-                    youtube_status = 'scheduled',
-                    youtube_last_error = NULL,
-                    updated_at = NOW()
-                WHERE id = %s
-                RETURNING
-                    id,
-                    youtube_publish_at,
-                    youtube_status
-                """,
-                (
-                    publish_datetime,
-                    short_id,
-                ),
+            file_path = Path(
+                f"/videos/short_{short_id_db}.mp4"
             )
 
-        else:
-
-            if instagram_status == "published":
+            if not file_path.is_file():
                 return {
                     "success": False,
                     "error": (
-                        "Short is already "
-                        "published on Instagram"
+                        "Video file is not stored "
+                        "in Railway Volume"
                     ),
                     "short_id": short_id,
                 }
 
-            if instagram_status == "requested":
-                return {
-                    "success": False,
-                    "error": (
-                        "Instagram publication "
-                        "is already in progress"
-                    ),
-                    "short_id": short_id,
-                }
+            if platform == "youtube":
 
-            cur.execute(
-                """
-                UPDATE shorts
-                SET
-                    instagram_publish_at = %s,
-                    instagram_status = 'scheduled',
-                    instagram_last_error = NULL,
-                    updated_at = NOW()
-                WHERE id = %s
-                RETURNING
-                    id,
-                    instagram_publish_at,
-                    instagram_status
-                """,
-                (
-                    publish_datetime,
-                    short_id,
+                if youtube_status == "published":
+                    return {
+                        "success": False,
+                        "error": (
+                            "Short is already "
+                            "published on YouTube"
+                        ),
+                        "short_id": short_id,
+                    }
+
+                if youtube_status == "requested":
+                    return {
+                        "success": False,
+                        "error": (
+                            "YouTube publication "
+                            "is already in progress"
+                        ),
+                        "short_id": short_id,
+                    }
+
+                cur.execute(
+                    """
+                    UPDATE shorts
+                    SET
+                        youtube_publish_at = %s,
+                        youtube_status = 'scheduled',
+                        youtube_last_error = NULL,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    RETURNING
+                        id,
+                        youtube_publish_at,
+                        youtube_status
+                    """,
+                    (
+                        publish_datetime,
+                        short_id,
+                    ),
+                )
+
+            else:
+
+                if instagram_status == "published":
+                    return {
+                        "success": False,
+                        "error": (
+                            "Short is already "
+                            "published on Instagram"
+                        ),
+                        "short_id": short_id,
+                    }
+
+                if instagram_status == "requested":
+                    return {
+                        "success": False,
+                        "error": (
+                            "Instagram publication "
+                            "is already in progress"
+                        ),
+                        "short_id": short_id,
+                    }
+
+                cur.execute(
+                    """
+                    UPDATE shorts
+                    SET
+                        instagram_publish_at = %s,
+                        instagram_status = 'scheduled',
+                        instagram_last_error = NULL,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    RETURNING
+                        id,
+                        instagram_publish_at,
+                        instagram_status
+                    """,
+                    (
+                        publish_datetime,
+                        short_id,
+                    ),
+                )
+
+            updated = cur.fetchone()
+
+            conn.commit()
+
+            return {
+                "success": True,
+                "short_id": updated[0],
+                "platform": platform,
+                "publish_at": (
+                    updated[1].isoformat()
                 ),
-            )
+                "status": updated[2],
+            }
 
-        updated = cur.fetchone()
+        except Exception:
+            conn.rollback()
+            raise
 
-        conn.commit()
-
-        return {
-            "success": True,
-            "short_id": updated[0],
-            "platform": platform,
-            "publish_at": (
-                updated[1].isoformat()
-            ),
-            "status": updated[2],
-        }
-
-    except Exception:
-        conn.rollback()
-        raise
-
-    finally:
-        cur.close()
-        conn.close()
+        finally:
+            cur.close()
+            conn.close()
 
 
 @mcp.tool()
@@ -2230,306 +2239,310 @@ def publish_to_youtube(
     Final success comes through callback.
     """
 
-    try:
-        publish_context = _short_publish_context(short_id, "youtube")
-    except ValueError as exc:
-        return {"success": False, "short_id": short_id, "error": str(exc)}
+    with video_files.lock(short_id):
+        file_error = video_files.verify_active_for_publish(short_id)
+        if file_error is not None:
+            return file_error
+        try:
+            publish_context = _short_publish_context(short_id, "youtube")
+        except ValueError as exc:
+            return {"success": False, "short_id": short_id, "error": str(exc)}
 
-    conn = get_db()
-    cur = conn.cursor()
+        conn = get_db()
+        cur = conn.cursor()
 
-    try:
+        try:
 
-        cur.execute(
-            """
-            SELECT
-                id,
-                status,
-                youtube_title,
-                youtube_description,
-                youtube_video_id,
-                youtube_status
-            FROM shorts
-            WHERE id = %s
-            """,
-            (short_id,),
-        )
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    status,
+                    youtube_title,
+                    youtube_description,
+                    youtube_video_id,
+                    youtube_status
+                FROM shorts
+                WHERE id = %s
+                """,
+                (short_id,),
+            )
 
-        row = cur.fetchone()
+            row = cur.fetchone()
 
-    finally:
-        cur.close()
-        conn.close()
+        finally:
+            cur.close()
+            conn.close()
 
-    if not row:
-        return {
-            "success": False,
-            "error":
-                "Short not found",
-            "short_id": short_id,
-        }
-
-    (
-        short_id_db,
-        status,
-        youtube_title,
-        youtube_description,
-        youtube_video_id,
-        youtube_status,
-    ) = row
-
-    if status != "completed":
-        return {
-            "success": False,
-            "error":
-                "Short is not completed",
-            "short_id": short_id,
-            "status": status,
-        }
-
-    file_path = Path(
-        f"/videos/short_{short_id_db}.mp4"
-    )
-
-    if not file_path.is_file():
-        return {
-            "success": False,
-            "error": (
-                "Video file is not stored in "
-                "Railway Volume. Run "
-                "download_completed_video first."
-            ),
-            "short_id": short_id,
-        }
-
-    if not youtube_title:
-        return {
-            "success": False,
-            "error":
-                "youtube_title is empty",
-            "short_id": short_id,
-        }
-
-    if not youtube_description:
-        return {
-            "success": False,
-            "error":
-                "youtube_description is empty",
-            "short_id": short_id,
-        }
-
-    if not force:
-
-        if youtube_status == "published":
+        if not row:
             return {
                 "success": False,
                 "error":
-                    "Short is already published "
-                    "on YouTube",
+                    "Short not found",
                 "short_id": short_id,
-                "youtube_video_id":
-                    youtube_video_id,
-                "youtube_status":
-                    youtube_status,
             }
 
-        if youtube_status == "requested":
+        (
+            short_id_db,
+            status,
+            youtube_title,
+            youtube_description,
+            youtube_video_id,
+            youtube_status,
+        ) = row
+
+        if status != "completed":
+            return {
+                "success": False,
+                "error":
+                    "Short is not completed",
+                "short_id": short_id,
+                "status": status,
+            }
+
+        file_path = Path(
+            f"/videos/short_{short_id_db}.mp4"
+        )
+
+        if not file_path.is_file():
             return {
                 "success": False,
                 "error": (
-                    "YouTube publication has "
-                    "already been requested. "
-                    "Use force=true only for "
-                    "an intentional retry."
+                    "Video file is not stored in "
+                    "Railway Volume. Run "
+                    "download_completed_video first."
                 ),
                 "short_id": short_id,
-                "youtube_status":
-                    youtube_status,
             }
 
-    payload = {
-        "project_id": publish_context["project_id"],
-        "project_code": publish_context["project_code"],
-        "short_id": short_id,
-        "title": youtube_title,
-        "description":
-            youtube_description,
-    }
+        if not youtube_title:
+            return {
+                "success": False,
+                "error":
+                    "youtube_title is empty",
+                "short_id": short_id,
+            }
 
-    body = json.dumps(
-        payload,
-        ensure_ascii=False,
-    ).encode("utf-8")
+        if not youtube_description:
+            return {
+                "success": False,
+                "error":
+                    "youtube_description is empty",
+                "short_id": short_id,
+            }
 
-    request = urllib.request.Request(
-        publish_context["webhook_url"],
-        data=body,
-        method="POST",
-        headers={
-            "Content-Type":
-                "application/json",
-            N8N_YOUTUBE_WEBHOOK_HEADER:
-                publish_context["webhook_key"],
-        },
-    )
+        if not force:
 
-    conn = get_db()
-    cur = conn.cursor()
+            if youtube_status == "published":
+                return {
+                    "success": False,
+                    "error":
+                        "Short is already published "
+                        "on YouTube",
+                    "short_id": short_id,
+                    "youtube_video_id":
+                        youtube_video_id,
+                    "youtube_status":
+                        youtube_status,
+                }
 
-    try:
+            if youtube_status == "requested":
+                return {
+                    "success": False,
+                    "error": (
+                        "YouTube publication has "
+                        "already been requested. "
+                        "Use force=true only for "
+                        "an intentional retry."
+                    ),
+                    "short_id": short_id,
+                    "youtube_status":
+                        youtube_status,
+                }
 
-        cur.execute(
-            """
-            UPDATE shorts
-            SET
-                youtube_status = 'requested',
-                youtube_last_error = NULL,
-                updated_at = NOW()
-            WHERE id = %s
-            """,
-            (short_id,),
+        payload = {
+            "project_id": publish_context["project_id"],
+            "project_code": publish_context["project_code"],
+            "short_id": short_id,
+            "title": youtube_title,
+            "description":
+                youtube_description,
+        }
+
+        body = json.dumps(
+            payload,
+            ensure_ascii=False,
+        ).encode("utf-8")
+
+        request = urllib.request.Request(
+            publish_context["webhook_url"],
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type":
+                    "application/json",
+                N8N_YOUTUBE_WEBHOOK_HEADER:
+                    publish_context["webhook_key"],
+            },
         )
 
-        conn.commit()
+        conn = get_db()
+        cur = conn.cursor()
 
-    finally:
-        cur.close()
-        conn.close()
+        try:
 
-    try:
-
-        with urllib.request.urlopen(
-            request,
-            timeout=30,
-        ) as response:
-
-            response_status = (
-                response.status
+            cur.execute(
+                """
+                UPDATE shorts
+                SET
+                    youtube_status = 'requested',
+                    youtube_last_error = NULL,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (short_id,),
             )
 
-            response_body = (
-                response.read(
-                    1024 * 1024
+            conn.commit()
+
+        finally:
+            cur.close()
+            conn.close()
+
+        try:
+
+            with urllib.request.urlopen(
+                request,
+                timeout=30,
+            ) as response:
+
+                response_status = (
+                    response.status
                 )
+
+                response_body = (
+                    response.read(
+                        1024 * 1024
+                    )
+                    .decode(
+                        "utf-8",
+                        errors="replace",
+                    )
+                )
+
+        except urllib.error.HTTPError as exc:
+
+            error_body = (
+                exc.read()
                 .decode(
                     "utf-8",
                     errors="replace",
                 )
             )
 
-    except urllib.error.HTTPError as exc:
+            conn = get_db()
+            cur = conn.cursor()
 
-        error_body = (
-            exc.read()
-            .decode(
-                "utf-8",
-                errors="replace",
-            )
-        )
+            try:
 
-        conn = get_db()
-        cur = conn.cursor()
-
-        try:
-
-            cur.execute(
-                """
-                UPDATE shorts
-                SET
-                    youtube_status = 'failed',
-                    youtube_last_error = %s,
-                    updated_at = NOW()
-                WHERE id = %s
-                """,
-                (
+                cur.execute(
+                    """
+                    UPDATE shorts
+                    SET
+                        youtube_status = 'failed',
+                        youtube_last_error = %s,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
                     (
-                        f"n8n HTTP "
-                        f"{exc.code}: "
-                        f"{error_body}"
-                    )[:2000],
-                    short_id,
+                        (
+                            f"n8n HTTP "
+                            f"{exc.code}: "
+                            f"{error_body}"
+                        )[:2000],
+                        short_id,
+                    ),
+                )
+
+                conn.commit()
+
+            finally:
+                cur.close()
+                conn.close()
+
+            return {
+                "success": False,
+                "error":
+                    f"n8n HTTP error "
+                    f"{exc.code}",
+                "short_id": short_id,
+                "details":
+                    error_body[:1000],
+            }
+
+        except Exception as exc:
+
+            conn = get_db()
+            cur = conn.cursor()
+
+            try:
+
+                cur.execute(
+                    """
+                    UPDATE shorts
+                    SET
+                        youtube_status = 'failed',
+                        youtube_last_error = %s,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (
+                        str(exc)[:2000],
+                        short_id,
+                    ),
+                )
+
+                conn.commit()
+
+            finally:
+                cur.close()
+                conn.close()
+
+            return {
+                "success": False,
+                "error":
+                    f"Failed to call n8n: {exc}",
+                "short_id": short_id,
+            }
+
+        if (
+            response_status < 200
+            or response_status >= 300
+        ):
+            return {
+                "success": False,
+                "error": (
+                    "Unexpected n8n status "
+                    f"{response_status}"
                 ),
-            )
-
-            conn.commit()
-
-        finally:
-            cur.close()
-            conn.close()
+                "short_id": short_id,
+            }
 
         return {
-            "success": False,
-            "error":
-                f"n8n HTTP error "
-                f"{exc.code}",
+            "success": True,
             "short_id": short_id,
-            "details":
-                error_body[:1000],
-        }
-
-    except Exception as exc:
-
-        conn = get_db()
-        cur = conn.cursor()
-
-        try:
-
-            cur.execute(
-                """
-                UPDATE shorts
-                SET
-                    youtube_status = 'failed',
-                    youtube_last_error = %s,
-                    updated_at = NOW()
-                WHERE id = %s
-                """,
-                (
-                    str(exc)[:2000],
-                    short_id,
-                ),
-            )
-
-            conn.commit()
-
-        finally:
-            cur.close()
-            conn.close()
-
-        return {
-            "success": False,
-            "error":
-                f"Failed to call n8n: {exc}",
-            "short_id": short_id,
-        }
-
-    if (
-        response_status < 200
-        or response_status >= 300
-    ):
-        return {
-            "success": False,
-            "error": (
-                "Unexpected n8n status "
-                f"{response_status}"
+            "youtube_status":
+                "requested",
+            "message": (
+                "Publication request accepted "
+                "by n8n. Waiting for "
+                "YouTube callback."
             ),
-            "short_id": short_id,
+            "n8n_http_status":
+                response_status,
+            "n8n_response":
+                response_body[:1000],
         }
-
-    return {
-        "success": True,
-        "short_id": short_id,
-        "youtube_status":
-            "requested",
-        "message": (
-            "Publication request accepted "
-            "by n8n. Waiting for "
-            "YouTube callback."
-        ),
-        "n8n_http_status":
-            response_status,
-        "n8n_response":
-            response_body[:1000],
-    }
 
 
 # =========================================================
@@ -2554,155 +2567,207 @@ def publish_to_instagram(
     Final success comes through callback.
     """
 
-    try:
-        publish_context = _short_publish_context(short_id, "instagram")
-    except ValueError as exc:
-        return {"success": False, "short_id": short_id, "error": str(exc)}
+    with video_files.lock(short_id):
+        file_error = video_files.verify_active_for_publish(short_id)
+        if file_error is not None:
+            return file_error
+        try:
+            publish_context = _short_publish_context(short_id, "instagram")
+        except ValueError as exc:
+            return {"success": False, "short_id": short_id, "error": str(exc)}
 
-    if not N8N_INSTAGRAM_WEBHOOK_URL:
-        return {
-            "success": False,
-            "error": (
-                "N8N_INSTAGRAM_WEBHOOK_URL "
-                "is not configured"
-            ),
-        }
+        if not N8N_INSTAGRAM_WEBHOOK_URL:
+            return {
+                "success": False,
+                "error": (
+                    "N8N_INSTAGRAM_WEBHOOK_URL "
+                    "is not configured"
+                ),
+            }
 
-    if not N8N_INSTAGRAM_WEBHOOK_KEY:
-        return {
-            "success": False,
-            "error": (
-                "N8N_INSTAGRAM_WEBHOOK_KEY "
-                "is not configured"
-            ),
-        }
+        if not N8N_INSTAGRAM_WEBHOOK_KEY:
+            return {
+                "success": False,
+                "error": (
+                    "N8N_INSTAGRAM_WEBHOOK_KEY "
+                    "is not configured"
+                ),
+            }
 
-    conn = get_db()
-    cur = conn.cursor()
+        conn = get_db()
+        cur = conn.cursor()
 
-    try:
+        try:
 
-        cur.execute(
-            """
-            SELECT
-                id,
-                topic,
-                status,
-                youtube_title,
-                youtube_description,
-                instagram_caption,
-                instagram_media_id,
-                instagram_status
-            FROM shorts
-            WHERE id = %s
-            """,
-            (short_id,),
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    topic,
+                    status,
+                    youtube_title,
+                    youtube_description,
+                    instagram_caption,
+                    instagram_media_id,
+                    instagram_status
+                FROM shorts
+                WHERE id = %s
+                """,
+                (short_id,),
+            )
+
+            row = cur.fetchone()
+
+        finally:
+            cur.close()
+            conn.close()
+
+        if not row:
+            return {
+                "success": False,
+                "error":
+                    "Short not found",
+                "short_id": short_id,
+            }
+
+        (
+            short_id_db,
+            topic,
+            status,
+            youtube_title,
+            youtube_description,
+            instagram_caption,
+            instagram_media_id,
+            instagram_status,
+        ) = row
+
+        if status != "completed":
+            return {
+                "success": False,
+                "error":
+                    "Short is not completed",
+                "short_id": short_id,
+                "status": status,
+            }
+
+        file_path = Path(
+            f"/videos/short_{short_id_db}.mp4"
         )
 
-        row = cur.fetchone()
-
-    finally:
-        cur.close()
-        conn.close()
-
-    if not row:
-        return {
-            "success": False,
-            "error":
-                "Short not found",
-            "short_id": short_id,
-        }
-
-    (
-        short_id_db,
-        topic,
-        status,
-        youtube_title,
-        youtube_description,
-        instagram_caption,
-        instagram_media_id,
-        instagram_status,
-    ) = row
-
-    if status != "completed":
-        return {
-            "success": False,
-            "error":
-                "Short is not completed",
-            "short_id": short_id,
-            "status": status,
-        }
-
-    file_path = Path(
-        f"/videos/short_{short_id_db}.mp4"
-    )
-
-    if not file_path.is_file():
-        return {
-            "success": False,
-            "error": (
-                "Video file is not stored in "
-                "Railway Volume. Run "
-                "download_completed_video first."
-            ),
-            "short_id": short_id,
-        }
-
-    if not force:
-
-        if (
-            instagram_status
-            == "published"
-        ):
+        if not file_path.is_file():
             return {
                 "success": False,
                 "error": (
-                    "Short is already "
-                    "published on Instagram"
+                    "Video file is not stored in "
+                    "Railway Volume. Run "
+                    "download_completed_video first."
                 ),
                 "short_id": short_id,
-                "instagram_media_id":
-                    instagram_media_id,
-                "instagram_status":
-                    instagram_status,
             }
 
-        if (
-            instagram_status
-            == "requested"
-        ):
+        if not force:
+
+            if (
+                instagram_status
+                == "published"
+            ):
+                return {
+                    "success": False,
+                    "error": (
+                        "Short is already "
+                        "published on Instagram"
+                    ),
+                    "short_id": short_id,
+                    "instagram_media_id":
+                        instagram_media_id,
+                    "instagram_status":
+                        instagram_status,
+                }
+
+            if (
+                instagram_status
+                == "requested"
+            ):
+                return {
+                    "success": False,
+                    "error": (
+                        "Instagram publication "
+                        "has already been requested. "
+                        "Use force=true only for "
+                        "an intentional retry."
+                    ),
+                    "short_id": short_id,
+                    "instagram_status":
+                        instagram_status,
+                }
+
+        final_caption = (
+            instagram_caption
+            or youtube_description
+            or youtube_title
+            or topic
+            or ""
+        ).strip()
+
+        if not final_caption:
             return {
                 "success": False,
-                "error": (
-                    "Instagram publication "
-                    "has already been requested. "
-                    "Use force=true only for "
-                    "an intentional retry."
-                ),
+                "error":
+                    "Instagram caption is empty",
                 "short_id": short_id,
-                "instagram_status":
-                    instagram_status,
             }
 
-    final_caption = (
-        instagram_caption
-        or youtube_description
-        or youtube_title
-        or topic
-        or ""
-    ).strip()
+        # Persist fallback caption if needed.
+        if not instagram_caption:
 
-    if not final_caption:
-        return {
-            "success": False,
-            "error":
-                "Instagram caption is empty",
+            conn = get_db()
+            cur = conn.cursor()
+
+            try:
+
+                cur.execute(
+                    """
+                    UPDATE shorts
+                    SET
+                        instagram_caption = %s,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (
+                        final_caption,
+                        short_id,
+                    ),
+                )
+
+                conn.commit()
+
+            finally:
+                cur.close()
+                conn.close()
+
+        signed_video = (
+            create_instagram_video_url(
+                short_id
+            )
+        )
+
+        payload = {
+            "project_id": publish_context["project_id"],
+            "project_code": publish_context["project_code"],
             "short_id": short_id,
+            "caption": final_caption,
+            "video_url":
+                signed_video["url"],
         }
 
-    # Persist fallback caption if needed.
-    if not instagram_caption:
+        body = json.dumps(
+            payload,
+            ensure_ascii=False,
+        ).encode("utf-8")
 
+        # Mark requested BEFORE calling n8n.
+        # This prevents a fast callback from
+        # being overwritten by requested later.
         conn = get_db()
         cur = conn.cursor()
 
@@ -2712,14 +2777,12 @@ def publish_to_instagram(
                 """
                 UPDATE shorts
                 SET
-                    instagram_caption = %s,
+                    instagram_status = 'requested',
+                    instagram_last_error = NULL,
                     updated_at = NOW()
                 WHERE id = %s
                 """,
-                (
-                    final_caption,
-                    short_id,
-                ),
+                (short_id,),
             )
 
             conn.commit()
@@ -2728,237 +2791,191 @@ def publish_to_instagram(
             cur.close()
             conn.close()
 
-    signed_video = (
-        create_instagram_video_url(
-            short_id
-        )
-    )
-
-    payload = {
-        "project_id": publish_context["project_id"],
-        "project_code": publish_context["project_code"],
-        "short_id": short_id,
-        "caption": final_caption,
-        "video_url":
-            signed_video["url"],
-    }
-
-    body = json.dumps(
-        payload,
-        ensure_ascii=False,
-    ).encode("utf-8")
-
-    # Mark requested BEFORE calling n8n.
-    # This prevents a fast callback from
-    # being overwritten by requested later.
-    conn = get_db()
-    cur = conn.cursor()
-
-    try:
-
-        cur.execute(
-            """
-            UPDATE shorts
-            SET
-                instagram_status = 'requested',
-                instagram_last_error = NULL,
-                updated_at = NOW()
-            WHERE id = %s
-            """,
-            (short_id,),
+        request = urllib.request.Request(
+            publish_context["webhook_url"],
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type":
+                    "application/json",
+                N8N_INSTAGRAM_WEBHOOK_HEADER:
+                    publish_context["webhook_key"],
+            },
         )
 
-        conn.commit()
+        try:
 
-    finally:
-        cur.close()
-        conn.close()
+            with urllib.request.urlopen(
+                request,
+                timeout=30,
+            ) as response:
 
-    request = urllib.request.Request(
-        publish_context["webhook_url"],
-        data=body,
-        method="POST",
-        headers={
-            "Content-Type":
-                "application/json",
-            N8N_INSTAGRAM_WEBHOOK_HEADER:
-                publish_context["webhook_key"],
-        },
-    )
-
-    try:
-
-        with urllib.request.urlopen(
-            request,
-            timeout=30,
-        ) as response:
-
-            response_status = (
-                response.status
-            )
-
-            response_body = (
-                response.read(
-                    1024 * 1024
+                response_status = (
+                    response.status
                 )
+
+                response_body = (
+                    response.read(
+                        1024 * 1024
+                    )
+                    .decode(
+                        "utf-8",
+                        errors="replace",
+                    )
+                )
+
+        except urllib.error.HTTPError as exc:
+
+            error_body = (
+                exc.read()
                 .decode(
                     "utf-8",
                     errors="replace",
                 )
             )
 
-    except urllib.error.HTTPError as exc:
+            error_message = (
+                f"n8n HTTP {exc.code}: "
+                f"{error_body}"
+            )[:2000]
 
-        error_body = (
-            exc.read()
-            .decode(
-                "utf-8",
-                errors="replace",
-            )
-        )
+            conn = get_db()
+            cur = conn.cursor()
 
-        error_message = (
-            f"n8n HTTP {exc.code}: "
-            f"{error_body}"
-        )[:2000]
+            try:
 
-        conn = get_db()
-        cur = conn.cursor()
-
-        try:
-
-            cur.execute(
-                """
-                UPDATE shorts
-                SET
-                    instagram_status = 'failed',
-                    instagram_last_error = %s,
-                    updated_at = NOW()
-                WHERE id = %s
-                """,
-                (
-                    error_message,
-                    short_id,
-                ),
-            )
-
-            conn.commit()
-
-        finally:
-            cur.close()
-            conn.close()
-
-        return {
-            "success": False,
-            "error":
-                f"n8n HTTP error "
-                f"{exc.code}",
-            "short_id": short_id,
-            "details":
-                error_body[:1000],
-        }
-
-    except Exception as exc:
-
-        error_message = (
-            str(exc)[:2000]
-        )
-
-        conn = get_db()
-        cur = conn.cursor()
-
-        try:
-
-            cur.execute(
-                """
-                UPDATE shorts
-                SET
-                    instagram_status = 'failed',
-                    instagram_last_error = %s,
-                    updated_at = NOW()
-                WHERE id = %s
-                """,
-                (
-                    error_message,
-                    short_id,
-                ),
-            )
-
-            conn.commit()
-
-        finally:
-            cur.close()
-            conn.close()
-
-        return {
-            "success": False,
-            "error":
-                f"Failed to call n8n: {exc}",
-            "short_id": short_id,
-        }
-
-    if (
-        response_status < 200
-        or response_status >= 300
-    ):
-
-        conn = get_db()
-        cur = conn.cursor()
-
-        try:
-
-            cur.execute(
-                """
-                UPDATE shorts
-                SET
-                    instagram_status = 'failed',
-                    instagram_last_error = %s,
-                    updated_at = NOW()
-                WHERE id = %s
-                """,
-                (
+                cur.execute(
+                    """
+                    UPDATE shorts
+                    SET
+                        instagram_status = 'failed',
+                        instagram_last_error = %s,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
                     (
-                        "Unexpected n8n status "
-                        f"{response_status}"
+                        error_message,
+                        short_id,
                     ),
-                    short_id,
-                ),
+                )
+
+                conn.commit()
+
+            finally:
+                cur.close()
+                conn.close()
+
+            return {
+                "success": False,
+                "error":
+                    f"n8n HTTP error "
+                    f"{exc.code}",
+                "short_id": short_id,
+                "details":
+                    error_body[:1000],
+            }
+
+        except Exception as exc:
+
+            error_message = (
+                str(exc)[:2000]
             )
 
-            conn.commit()
+            conn = get_db()
+            cur = conn.cursor()
 
-        finally:
-            cur.close()
-            conn.close()
+            try:
+
+                cur.execute(
+                    """
+                    UPDATE shorts
+                    SET
+                        instagram_status = 'failed',
+                        instagram_last_error = %s,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (
+                        error_message,
+                        short_id,
+                    ),
+                )
+
+                conn.commit()
+
+            finally:
+                cur.close()
+                conn.close()
+
+            return {
+                "success": False,
+                "error":
+                    f"Failed to call n8n: {exc}",
+                "short_id": short_id,
+            }
+
+        if (
+            response_status < 200
+            or response_status >= 300
+        ):
+
+            conn = get_db()
+            cur = conn.cursor()
+
+            try:
+
+                cur.execute(
+                    """
+                    UPDATE shorts
+                    SET
+                        instagram_status = 'failed',
+                        instagram_last_error = %s,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (
+                        (
+                            "Unexpected n8n status "
+                            f"{response_status}"
+                        ),
+                        short_id,
+                    ),
+                )
+
+                conn.commit()
+
+            finally:
+                cur.close()
+                conn.close()
+
+            return {
+                "success": False,
+                "error": (
+                    "Unexpected n8n status "
+                    f"{response_status}"
+                ),
+                "short_id": short_id,
+            }
 
         return {
-            "success": False,
-            "error": (
-                "Unexpected n8n status "
-                f"{response_status}"
-            ),
+            "success": True,
             "short_id": short_id,
+            "instagram_status":
+                "requested",
+            "message": (
+                "Instagram publication request "
+                "accepted by n8n. Waiting for "
+                "Instagram callback."
+            ),
+            "video_url_expires_at":
+                signed_video["expires"],
+            "video_url_ttl_seconds":
+                signed_video["ttl_seconds"],
+            "n8n_http_status":
+                response_status,
+            "n8n_response":
+                response_body[:1000],
         }
-
-    return {
-        "success": True,
-        "short_id": short_id,
-        "instagram_status":
-            "requested",
-        "message": (
-            "Instagram publication request "
-            "accepted by n8n. Waiting for "
-            "Instagram callback."
-        ),
-        "video_url_expires_at":
-            signed_video["expires"],
-        "video_url_ttl_seconds":
-            signed_video["ttl_seconds"],
-        "n8n_http_status":
-            response_status,
-        "n8n_response":
-            response_body[:1000],
-    }
 
 
 # =========================================================
@@ -4585,6 +4602,10 @@ class APIKeyMiddleware:
 from social_analytics import (AnalyticsMiddleware, ensure_analytics_schema, register_analytics_tools)
 register_analytics_tools(mcp, get_db)
 
+from video_uploads import VideoFiles, VideoUploadMiddleware, ensure_video_upload_schema, register_video_upload_tools
+video_files = VideoFiles(get_db, RAILWAY_BASE_URL)
+register_video_upload_tools(mcp, video_files)
+
 if __name__ == "__main__":
     import uvicorn
 
@@ -4595,6 +4616,7 @@ if __name__ == "__main__":
 
     ensure_database_schema()
     ensure_analytics_schema(get_db)
+    ensure_video_upload_schema(get_db)
     print(
         "DATABASE SCHEMA OK",
         flush=True,
@@ -4624,6 +4646,7 @@ if __name__ == "__main__":
     )
 
     app = AnalyticsMiddleware(app, get_db)
+    app = VideoUploadMiddleware(app, video_files)
 
     uvicorn.run(
         app,
