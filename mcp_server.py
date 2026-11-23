@@ -1748,6 +1748,241 @@ def delete_video_file(
             }
 
 # =========================================================
+# QUEUE CLEANUP: CANCEL / DELETE
+# =========================================================
+
+import logging
+
+_cleanup_log = logging.getLogger("queue_cleanup")
+
+_PROTECTED_PLATFORM_STATUSES = {"published", "requested"}
+
+
+def _delete_blockers(row, include_scheduled: bool) -> list:
+    """Reasons why a short must not be deleted. row = (status, yt, ig)."""
+    status, yt, ig = row
+    blockers = []
+    if status == "generating":
+        blockers.append("short is being generated")
+    for name, st in (("youtube", yt), ("instagram", ig)):
+        if st in _PROTECTED_PLATFORM_STATUSES:
+            blockers.append(f"{name} is {st}")
+        elif st == "scheduled" and not include_scheduled:
+            blockers.append(f"{name} is scheduled (cancel it first or pass include_scheduled=true)")
+    return blockers
+
+
+def _delete_short_files(short_id: int, asset_ids: list) -> int:
+    """Remove canonical and uploaded MP4 files of a short. Returns freed bytes."""
+    freed = 0
+    paths = [video_files.canonical(short_id)]
+    for aid in asset_ids:
+        try:
+            paths.append(video_files.root / "file-assets" / (str(aid) + ".mp4"))
+        except Exception:
+            continue
+    for path in paths:
+        try:
+            if path.is_file():
+                freed += path.stat().st_size
+                path.unlink()
+        except Exception as exc:
+            _cleanup_log.warning("could not delete %s: %s", path, exc)
+    return freed
+
+
+@mcp.tool()
+def cancel_publication(
+    short_id: int,
+    platform: str,
+) -> dict:
+    """
+    Cancel a SCHEDULED publication of one Short on one platform.
+
+    platform: youtube | instagram
+
+    Only works when that platform status is 'scheduled'.
+    Status returns to 'pending' and the publish time is cleared.
+    Refuses published and in-progress (requested) publications.
+    The Short itself and its video file are kept.
+    """
+
+    platform = str(platform).strip().lower()
+    if platform not in {"youtube", "instagram"}:
+        return {
+            "success": False,
+            "error": "platform must be 'youtube' or 'instagram'",
+        }
+
+    with video_files.lock(short_id):
+        conn = get_db()
+        cur = conn.cursor()
+        try:
+            col = f"{platform}_status"
+            cur.execute(
+                f"SELECT {col} FROM shorts WHERE id = %s FOR UPDATE",
+                (short_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return {"success": False, "error": "Short not found", "short_id": short_id}
+            if row[0] != "scheduled":
+                return {
+                    "success": False,
+                    "error": f"Only scheduled publications can be cancelled; {platform} status is {row[0]!r}",
+                    "short_id": short_id,
+                }
+            cur.execute(
+                f"""
+                UPDATE shorts
+                SET {col} = 'pending',
+                    {platform}_publish_at = NULL,
+                    {platform}_last_error = NULL,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (short_id,),
+            )
+            conn.commit()
+            _cleanup_log.info("cancel_publication short=%s platform=%s", short_id, platform)
+            return {
+                "success": True,
+                "short_id": short_id,
+                "platform": platform,
+                "status": "pending",
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
+            conn.close()
+
+
+def _delete_one_short(short_id: int, include_scheduled: bool) -> dict:
+    with video_files.lock(short_id):
+        conn = get_db()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT status, youtube_status, instagram_status
+                FROM shorts WHERE id = %s FOR UPDATE
+                """,
+                (short_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return {"success": False, "short_id": short_id, "error": "Short not found"}
+            blockers = _delete_blockers(row, include_scheduled)
+            if blockers:
+                return {
+                    "success": False,
+                    "short_id": short_id,
+                    "error": "; ".join(blockers),
+                }
+            cur.execute(
+                "SELECT asset_id FROM video_file_assets WHERE short_id = %s",
+                (short_id,),
+            )
+            asset_ids = [r[0] for r in cur.fetchall()]
+            cur.execute("DELETE FROM video_file_uploads WHERE short_id = %s", (short_id,))
+            cur.execute("DELETE FROM video_file_assets WHERE short_id = %s", (short_id,))
+            cur.execute("DELETE FROM shorts WHERE id = %s", (short_id,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
+            conn.close()
+        freed = _delete_short_files(short_id, asset_ids)
+        _cleanup_log.info(
+            "delete_short short=%s freed_bytes=%s include_scheduled=%s",
+            short_id, freed, include_scheduled,
+        )
+        return {"success": True, "short_id": short_id, "freed_bytes": freed}
+
+
+@mcp.tool()
+def delete_short(
+    short_id: int,
+    include_scheduled: bool = False,
+) -> dict:
+    """
+    Delete one Short: database row, upload records and its MP4 files.
+
+    Refuses: published, in-progress (requested) publications and
+    Shorts being generated. Refuses scheduled ones unless
+    include_scheduled=true (then the schedule is dropped with the row).
+    Cannot be undone.
+    """
+
+    return _delete_one_short(short_id, include_scheduled)
+
+
+@mcp.tool()
+def purge_queue(
+    project_id: int,
+    confirm: bool = False,
+    include_scheduled: bool = False,
+) -> dict:
+    """
+    Delete all not-yet-published Shorts of one project
+    (rows, upload records, MP4 files).
+
+    Without confirm=true nothing is deleted: returns a preview
+    of what WOULD be deleted and what is protected.
+    Never touches published or in-progress (requested) items or
+    Shorts being generated. Scheduled items are deleted only with
+    include_scheduled=true. Cannot be undone.
+    """
+
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT id, status, youtube_status, instagram_status
+            FROM shorts WHERE project_id = %s ORDER BY id
+            """,
+            (project_id,),
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+
+    will_delete, protected = [], []
+    for sid, status, yt, ig in rows:
+        blockers = _delete_blockers((status, yt, ig), include_scheduled)
+        (protected if blockers else will_delete).append(
+            {"short_id": sid, "reasons": blockers} if blockers else sid
+        )
+
+    if not confirm:
+        return {
+            "success": True,
+            "dry_run": True,
+            "project_id": project_id,
+            "would_delete": will_delete,
+            "protected": protected,
+            "message": "Nothing deleted. Call again with confirm=true to delete.",
+        }
+
+    results = [_delete_one_short(sid, include_scheduled) for sid in will_delete]
+    return {
+        "success": True,
+        "dry_run": False,
+        "project_id": project_id,
+        "deleted": [r["short_id"] for r in results if r.get("success")],
+        "failed": [r for r in results if not r.get("success")],
+        "protected": protected,
+        "freed_bytes": sum(r.get("freed_bytes", 0) for r in results if r.get("success")),
+    }
+
+
+# =========================================================
 # PUBLICATION SCHEDULING
 # =========================================================
 
